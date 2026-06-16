@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Image Duplication Audit"
+  short_description: "Detect suspicious image reuse in scientific papers."
+  default_prompt: "Use $paper-image-duplication-audit to audit this paper PDF for duplicated or reused figure images and produce a reviewable report with highlighted suspicious regions."
