@@ -57,9 +57,9 @@ OCR preprocessed images, TSV, parsed word boxes, and diagnostic overlays are sav
 5. Segment figures into panels and run Tesseract OCR on each cropped figure image.
 6. Prefer OCR-detected rasterized panel labels such as `A`, `B`, `C`; fall back to row-major labels when OCR is unavailable or uncertain.
 7. Classify blot-like panels by detecting a large grayscale blot ROI.
-8. Extract both strip-level and local band-patch candidates from blot panels, and use high-confidence OCR text boxes to suppress text-like false positives.
-9. Compare candidates only within the same figure/category by normalized cross-correlation.
-10. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence.
+8. Extract both strip-level and local band-patch candidates from blot panels, require minimum evidence-patch size, and use high-confidence OCR text boxes to suppress text-like false positives.
+9. Compare candidates only within the same figure/category by normalized cross-correlation, while filtering undersized or mismatched patch pairs that are prone to false positives.
+10. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence, evidence area, area ratio, and optional context score.
 
 ## Installation Dependencies
 
@@ -77,6 +77,8 @@ Use `scripts/install_dependencies.sh` or `scripts/install_dependencies.ps1` to m
 - Run the platform installer when `pymupdf`, `tesseract`, `chi_sim`, or `chi_tra` is missing.
 - Use the bundled Python runtime when the system Python lacks Pillow/NumPy.
 - Use `--min-score` to adjust sensitivity. Start with `0.82` for routine triage; lower to `0.70` when exploring faint or heavily compressed bands.
+- Keep the default `--min-patch-area 450`, `--min-patch-width 18`, `--min-patch-height 12`, and `--min-area-ratio 0.55` for routine WB/gel audits. Raise `--min-patch-area` to suppress tiny-band false positives; lower it only for exploratory checks of very small bands.
+- Use `--min-context-score` only as a stricter second-pass filter. The report always records context score, but the default is `0.0` because cropped WB bands can have valid local reuse even when surrounding lanes differ.
 - Use the default `--dpi 180` for cross-platform PyMuPDF audits. Lower values such as `--dpi 150` reduce runtime but can lower small band similarity scores.
 - Use `--keep-existing` to reuse PDF layout and rendered pages while tuning segmentation/comparison.
 - Inspect `ocr/*_overlay.png` when panel labels look wrong or when OCR text-filtered strip counts are unexpectedly high.
@@ -89,6 +91,7 @@ Read `references/review-rules.md` before making a written assessment. Always des
 
 - Panel labels fall back to row-major order when rasterized labels are missing, too stylized, or not confidently recognized by OCR.
 - OCR text filtering is conservative and only removes strip candidates that are mostly covered by high-confidence text boxes.
+- Very small local band patches are filtered by default because resizing tiny blobs can create artificially high correlation scores.
 - Figure discovery still depends on the PDF text layer. For scanned PDFs on any platform, add page-level OCR title/caption detection before relying on this workflow.
 - The first version focuses on Western blot/gel reuse. Microscopy and flow cytometry support should be extended with category-specific extractors before relying on those classes.
 - Similar band-shaped biological signals can look alike. High scores require visual review of the highlighted context, lane identity, and caption claims.

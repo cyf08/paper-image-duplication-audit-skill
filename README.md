@@ -44,6 +44,21 @@ Windows PowerShell:
 - macOS can fall back to the bundled Swift/PDFKit helpers if PyMuPDF is unavailable, or when `--pdf-backend swift` is set.
 - Tesseract OCR is required for OCR-assisted panel labels and text filtering.
 
+## WB/Gel False-Positive Controls
+
+The audit script filters tiny WB/gel patch candidates by default because very small dark blobs can become artificially similar after resizing. Routine audits use:
+
+```bash
+python3 paper-image-duplication-audit/scripts/audit_paper_images.py manuscript.pdf \
+  --out audit-output \
+  --min-patch-area 450 \
+  --min-patch-width 18 \
+  --min-patch-height 12 \
+  --min-area-ratio 0.55
+```
+
+Raise `--min-patch-area` for a stricter second pass, or lower it only for exploratory checks of very small bands. `report.html` and `results.json` include evidence area, area ratio, context score, and skipped-pair counts for manual review.
+
 ## Package
 
 The same skill is also available as a tarball under `dist/`.

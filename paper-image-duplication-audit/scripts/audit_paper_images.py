@@ -55,6 +55,7 @@ class PanelCandidate:
     ocr_word_count: int
     strip_count: int
     text_filtered_strip_count: int
+    small_filtered_strip_count: int
 
 
 @dataclass
@@ -77,8 +78,12 @@ class MatchCandidate:
     strip_a: str
     strip_b: str
     score: float
+    context_score: float
     orientation: str
     level: str
+    evidence_area_a: int
+    evidence_area_b: int
+    area_ratio: float
     panel_a_image: str
     panel_b_image: str
     strip_a_image: str
@@ -98,6 +103,16 @@ class OcrWord:
 class StripExtractionResult:
     strips: list[tuple[tuple[int, int, int, int], float]]
     text_filtered_count: int
+    small_filtered_count: int
+
+
+@dataclass
+class ComparisonStats:
+    pairs_considered: int = 0
+    pairs_skipped_small: int = 0
+    pairs_skipped_size_mismatch: int = 0
+    pairs_skipped_context: int = 0
+    pairs_below_score: int = 0
 
 
 def log(message: str) -> None:
@@ -795,6 +810,32 @@ def expand_box(
     )
 
 
+def box_area(box: tuple[int, int, int, int]) -> int:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def box_size(box: tuple[int, int, int, int]) -> tuple[int, int]:
+    return max(0, box[2] - box[0]), max(0, box[3] - box[1])
+
+
+def box_area_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    area_a = box_area(a)
+    area_b = box_area(b)
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+    return min(area_a, area_b) / max(area_a, area_b)
+
+
+def has_minimum_evidence(
+    box: tuple[int, int, int, int],
+    min_area: int,
+    min_width: int,
+    min_height: int,
+) -> bool:
+    width, height = box_size(box)
+    return width >= min_width and height >= min_height and width * height >= min_area
+
+
 def normalize_panel_label(text: str) -> str | None:
     clean = re.sub(r"[^A-Za-z]", "", text).upper()
     if len(clean) == 1 and clean in PANEL_LETTERS:
@@ -972,14 +1013,21 @@ def panel_features(image: Image.Image) -> tuple[str, float, float]:
     return category, colorfulness, horizontal_score
 
 
-def extract_strips(panel: Image.Image, text_words: list[OcrWord] | None = None) -> StripExtractionResult:
+def extract_strips(
+    panel: Image.Image,
+    text_words: list[OcrWord] | None = None,
+    min_patch_area: int = 450,
+    min_patch_width: int = 18,
+    min_patch_height: int = 12,
+) -> StripExtractionResult:
     gray = np.array(panel.convert("L"))
     roi = detect_blot_roi(panel)
     if roi is None:
-        return StripExtractionResult(strips=[], text_filtered_count=0)
+        return StripExtractionResult(strips=[], text_filtered_count=0, small_filtered_count=0)
 
     candidates: list[tuple[tuple[int, int, int, int], float]] = []
     text_filtered_count = 0
+    small_filtered_count = 0
     text_words = text_words or []
     x0, y0, x1, y1 = roi
     roi_h = y1 - y0
@@ -1023,6 +1071,9 @@ def extract_strips(panel: Image.Image, text_words: list[OcrWord] | None = None) 
             min(gray.shape[1], x0 + bx1 + 7),
             min(gray.shape[0], y0 + by1 + 5),
         )
+        if not has_minimum_evidence(box, min_patch_area, min_patch_width, min_patch_height):
+            small_filtered_count += 1
+            continue
         patch = gray[box[1] : box[3], box[0] : box[2]]
         variance = float(np.std(patch))
         dark_fraction = float((patch < 190).mean())
@@ -1056,6 +1107,7 @@ def extract_strips(panel: Image.Image, text_words: list[OcrWord] | None = None) 
     return StripExtractionResult(
         strips=sorted(deduped, key=lambda item: (item[0][1], item[0][0])),
         text_filtered_count=text_filtered_count,
+        small_filtered_count=small_filtered_count,
     )
 
 
@@ -1064,6 +1116,9 @@ def segment_and_save_panels(
     panels_dir: Path,
     strips_dir: Path,
     ocr_dir: Path | None = None,
+    min_patch_area: int = 450,
+    min_patch_width: int = 18,
+    min_patch_height: int = 12,
 ) -> tuple[list[PanelCandidate], list[StripCandidate]]:
     panels_dir.mkdir(parents=True, exist_ok=True)
     strips_dir.mkdir(parents=True, exist_ok=True)
@@ -1097,9 +1152,15 @@ def segment_and_save_panels(
             category, colorfulness, horizontal_score = panel_features(crop)
             panel_words = words_for_box(ocr_words, box)
             if category == "blot":
-                strip_result = extract_strips(crop, panel_words)
+                strip_result = extract_strips(
+                    crop,
+                    panel_words,
+                    min_patch_area=min_patch_area,
+                    min_patch_width=min_patch_width,
+                    min_patch_height=min_patch_height,
+                )
             else:
-                strip_result = StripExtractionResult(strips=[], text_filtered_count=0)
+                strip_result = StripExtractionResult(strips=[], text_filtered_count=0, small_filtered_count=0)
             panel_name = f"figure-{figure.figure_number}_page-{figure.page:03d}_panel-{label}"
             panel_path = panels_dir / f"{panel_name}.png"
             crop.save(panel_path)
@@ -1118,6 +1179,7 @@ def segment_and_save_panels(
                 ocr_word_count=len(panel_words),
                 strip_count=len(strip_result.strips),
                 text_filtered_strip_count=strip_result.text_filtered_count,
+                small_filtered_strip_count=strip_result.small_filtered_count,
             )
             panels.append(panel)
 
@@ -1165,6 +1227,22 @@ def normalized_patch(path: str, flip: str = "none", size: tuple[int, int] = (180
     return arr / std
 
 
+def normalized_image(image: Image.Image, flip: str = "none", size: tuple[int, int] = (220, 80)) -> np.ndarray:
+    image = image.convert("L")
+    if flip == "h":
+        image = ImageOps.mirror(image)
+    elif flip == "v":
+        image = ImageOps.flip(image)
+    image = ImageOps.autocontrast(image, cutoff=1)
+    image = image.resize(size, Image.Resampling.BICUBIC)
+    arr = np.array(image).astype(float)
+    arr = arr - arr.mean()
+    std = arr.std()
+    if std < 1e-6:
+        return arr
+    return arr / std
+
+
 def ncc(a: np.ndarray, b: np.ndarray) -> float:
     if a.shape != b.shape:
         raise ValueError("NCC arrays must have the same shape")
@@ -1185,6 +1263,25 @@ def strip_similarity(path_a: str, path_b: str) -> tuple[float, str]:
             best_score = score
             best_orientation = orientation
     return best_score, best_orientation
+
+
+def context_similarity(
+    panel_a: PanelCandidate,
+    panel_b: PanelCandidate,
+    strip_a: StripCandidate,
+    strip_b: StripCandidate,
+    orientation: str,
+    margin: int,
+) -> float:
+    if margin <= 0:
+        return 0.0
+    image_a = Image.open(panel_a.image_path).convert("L")
+    image_b = Image.open(panel_b.image_path).convert("L")
+    context_a = expand_box(strip_a.bbox, margin, margin, image_a.width, image_a.height)
+    context_b = expand_box(strip_b.bbox, margin, margin, image_b.width, image_b.height)
+    patch_a = normalized_image(image_a.crop(context_a))
+    patch_b = normalized_image(image_b.crop(context_b), flip=orientation)
+    return ncc(patch_a, patch_b)
 
 
 def candidate_level(score: float) -> str:
@@ -1234,17 +1331,35 @@ def compare_strips(
     matches_dir: Path,
     min_score: float,
     top_n: int,
-) -> list[MatchCandidate]:
+    min_patch_area: int,
+    min_patch_width: int,
+    min_patch_height: int,
+    min_area_ratio: float,
+    min_context_score: float,
+    context_margin: int,
+) -> tuple[list[MatchCandidate], ComparisonStats]:
     panels_by_key = {(p.figure, p.page, p.label): p for p in panels}
     strips_by_figure: dict[tuple[str, int], list[StripCandidate]] = {}
     for strip in strips:
         strips_by_figure.setdefault((strip.figure, strip.page), []).append(strip)
 
-    candidates: list[MatchCandidate] = []
+    candidates: list[tuple[MatchCandidate, PanelCandidate, PanelCandidate, StripCandidate, StripCandidate]] = []
+    stats = ComparisonStats()
     for (figure, page), figure_strips in strips_by_figure.items():
         for i, strip_a in enumerate(figure_strips):
             for strip_b in figure_strips[i + 1 :]:
                 if strip_a.panel_label == strip_b.panel_label:
+                    continue
+                stats.pairs_considered += 1
+                if not has_minimum_evidence(strip_a.bbox, min_patch_area, min_patch_width, min_patch_height):
+                    stats.pairs_skipped_small += 1
+                    continue
+                if not has_minimum_evidence(strip_b.bbox, min_patch_area, min_patch_width, min_patch_height):
+                    stats.pairs_skipped_small += 1
+                    continue
+                area_ratio = box_area_ratio(strip_a.bbox, strip_b.bbox)
+                if area_ratio < min_area_ratio:
+                    stats.pairs_skipped_size_mismatch += 1
                     continue
                 panel_a = panels_by_key[(figure, page, strip_a.panel_label)]
                 panel_b = panels_by_key[(figure, page, strip_b.panel_label)]
@@ -1252,36 +1367,49 @@ def compare_strips(
                     continue
                 score, orientation = strip_similarity(strip_a.image_path, strip_b.image_path)
                 if score < min_score:
+                    stats.pairs_below_score += 1
+                    continue
+                context_score = context_similarity(panel_a, panel_b, strip_a, strip_b, orientation, context_margin)
+                if min_context_score > 0 and context_score < min_context_score:
+                    stats.pairs_skipped_context += 1
                     continue
                 review_name = (
                     f"{figure.lower().replace(' ', '-')}_"
                     f"{strip_a.strip_label}_vs_{strip_b.strip_label}_{score:.3f}.png"
                 )
                 review_path = matches_dir / review_name
-                draw_review_image(panel_a, panel_b, strip_a, strip_b, review_path)
-                note = "Same-category WB/gel strips show high normalized cross-correlation after contrast normalization."
-                candidates.append(
-                    MatchCandidate(
-                        figure=figure,
-                        page=page,
-                        panel_a=strip_a.panel_label,
-                        panel_b=strip_b.panel_label,
-                        strip_a=strip_a.strip_label,
-                        strip_b=strip_b.strip_label,
-                        score=round(score, 4),
-                        orientation=orientation,
-                        level=candidate_level(score),
-                        panel_a_image=panel_a.image_path,
-                        panel_b_image=panel_b.image_path,
-                        strip_a_image=strip_a.image_path,
-                        strip_b_image=strip_b.image_path,
-                        review_image=str(review_path),
-                        note=note,
-                    )
+                note = (
+                    "Same-category WB/gel strips pass minimum evidence-size filters and show high "
+                    "normalized cross-correlation after contrast normalization."
                 )
+                match = MatchCandidate(
+                    figure=figure,
+                    page=page,
+                    panel_a=strip_a.panel_label,
+                    panel_b=strip_b.panel_label,
+                    strip_a=strip_a.strip_label,
+                    strip_b=strip_b.strip_label,
+                    score=round(score, 4),
+                    context_score=round(context_score, 4),
+                    orientation=orientation,
+                    level=candidate_level(score),
+                    evidence_area_a=box_area(strip_a.bbox),
+                    evidence_area_b=box_area(strip_b.bbox),
+                    area_ratio=round(area_ratio, 4),
+                    panel_a_image=panel_a.image_path,
+                    panel_b_image=panel_b.image_path,
+                    strip_a_image=strip_a.image_path,
+                    strip_b_image=strip_b.image_path,
+                    review_image=str(review_path),
+                    note=note,
+                )
+                candidates.append((match, panel_a, panel_b, strip_a, strip_b))
 
-    candidates.sort(key=lambda c: c.score, reverse=True)
-    return candidates[:top_n]
+    candidates.sort(key=lambda c: c[0].score, reverse=True)
+    top_candidates = candidates[:top_n]
+    for match, panel_a, panel_b, strip_a, strip_b in top_candidates:
+        draw_review_image(panel_a, panel_b, strip_a, strip_b, Path(match.review_image))
+    return [match for match, _, _, _, _ in top_candidates], stats
 
 
 def relative_to(path: str | Path, root: Path) -> str:
@@ -1300,10 +1428,15 @@ def write_report(
     panels: list[PanelCandidate],
     strips: list[StripCandidate],
     matches: list[MatchCandidate],
+    comparison_stats: ComparisonStats,
+    settings: dict[str, float | int | str],
 ) -> None:
     ocr_label_count = sum(1 for panel in panels if panel.label_source == "ocr")
     text_filtered_strip_count = sum(panel.text_filtered_strip_count for panel in panels)
+    small_filtered_strip_count = sum(panel.small_filtered_strip_count for panel in panels)
     results = {
+        "settings": settings,
+        "comparison_stats": asdict(comparison_stats),
         "figures": [asdict(f) for f in figures],
         "panels": [asdict(p) for p in panels],
         "strips": [asdict(s) for s in strips],
@@ -1322,7 +1455,12 @@ def write_report(
         f"- OCR panel labels: {ocr_label_count}",
         f"- WB/gel strips extracted: {len(strips)}",
         f"- OCR text-filtered strip candidates: {text_filtered_strip_count}",
+        f"- Small WB/gel patch candidates filtered: {small_filtered_strip_count}",
         f"- Suspicious candidates: {len(matches)}",
+        f"- Pairwise comparisons considered: {comparison_stats.pairs_considered}",
+        f"- Pairs skipped for small evidence patches: {comparison_stats.pairs_skipped_small}",
+        f"- Pairs skipped for size mismatch: {comparison_stats.pairs_skipped_size_mismatch}",
+        f"- Pairs skipped for context threshold: {comparison_stats.pairs_skipped_context}",
         "",
         "## Suspicious Candidates",
         "",
@@ -1338,6 +1476,9 @@ def write_report(
                 f"- Page: {match.page}",
                 f"- Strips: {match.strip_a} vs {match.strip_b}",
                 f"- Score: {match.score:.4f}",
+                f"- Context score: {match.context_score:.4f}",
+                f"- Evidence area: {match.evidence_area_a} px vs {match.evidence_area_b} px",
+                f"- Area ratio: {match.area_ratio:.4f}",
                 f"- Orientation: {match.orientation}",
                 f"- Note: {match.note}",
                 "",
@@ -1358,11 +1499,13 @@ def write_report(
             f"<td>{match.page}</td>"
             f"<td>{html.escape(match.strip_a)} vs {html.escape(match.strip_b)}</td>"
             f"<td>{match.score:.4f}</td>"
+            f"<td>{match.context_score:.4f}</td>"
+            f"<td>{match.evidence_area_a} / {match.evidence_area_b}<br>ratio {match.area_ratio:.3f}</td>"
             f"<td>{html.escape(match.orientation)}</td>"
             f"<td><img src=\"{rel_review}\" /></td>"
             "</tr>"
         )
-    table_body = "\n".join(rows) if rows else "<tr><td colspan=\"7\">No candidates passed the threshold.</td></tr>"
+    table_body = "\n".join(rows) if rows else "<tr><td colspan=\"9\">No candidates passed the threshold.</td></tr>"
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1390,11 +1533,14 @@ def write_report(
     <div class="metric"><b>{ocr_label_count}</b>OCR panel labels</div>
     <div class="metric"><b>{len(strips)}</b>WB/gel strips</div>
     <div class="metric"><b>{text_filtered_strip_count}</b>OCR text-filtered strips</div>
+    <div class="metric"><b>{small_filtered_strip_count}</b>Small patches filtered</div>
     <div class="metric"><b>{len(matches)}</b>Suspicious candidates</div>
+    <div class="metric"><b>{comparison_stats.pairs_skipped_small}</b>Small-patch pairs skipped</div>
+    <div class="metric"><b>{comparison_stats.pairs_skipped_size_mismatch}</b>Size-mismatch pairs skipped</div>
   </div>
   <table>
     <thead>
-      <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Score</th><th>Orientation</th><th>Review</th></tr>
+      <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Score</th><th>Context</th><th>Evidence Area</th><th>Orientation</th><th>Review</th></tr>
     </thead>
     <tbody>
       {table_body}
@@ -1414,6 +1560,42 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--figure", type=int, help="Limit audit to a single figure number")
     parser.add_argument("--min-score", type=float, default=0.82, help="Minimum strip similarity to report")
     parser.add_argument("--top-n", type=int, default=40, help="Maximum candidate matches to report")
+    parser.add_argument(
+        "--min-patch-area",
+        type=int,
+        default=450,
+        help="Minimum WB/gel evidence patch area in pixels; raise to suppress small-patch false positives",
+    )
+    parser.add_argument(
+        "--min-patch-width",
+        type=int,
+        default=18,
+        help="Minimum WB/gel evidence patch width in pixels",
+    )
+    parser.add_argument(
+        "--min-patch-height",
+        type=int,
+        default=12,
+        help="Minimum WB/gel evidence patch height in pixels",
+    )
+    parser.add_argument(
+        "--min-area-ratio",
+        type=float,
+        default=0.55,
+        help="Minimum smaller/larger evidence-patch area ratio for pairwise comparison",
+    )
+    parser.add_argument(
+        "--min-context-score",
+        type=float,
+        default=0.0,
+        help="Optional minimum NCC for expanded local context; 0 disables context filtering",
+    )
+    parser.add_argument(
+        "--context-margin",
+        type=int,
+        default=10,
+        help="Pixel margin around each evidence patch used to compute context score",
+    )
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing rendered pages/layout when present")
     parser.add_argument(
         "--pdf-backend",
@@ -1460,11 +1642,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir / "panels",
         output_dir / "strips",
         output_dir / "ocr",
+        min_patch_area=args.min_patch_area,
+        min_patch_width=args.min_patch_width,
+        min_patch_height=args.min_patch_height,
     )
     log("Comparing same-category strips...")
-    matches = compare_strips(panels, strips, output_dir / "matches", args.min_score, args.top_n)
+    matches, comparison_stats = compare_strips(
+        panels,
+        strips,
+        output_dir / "matches",
+        args.min_score,
+        args.top_n,
+        min_patch_area=args.min_patch_area,
+        min_patch_width=args.min_patch_width,
+        min_patch_height=args.min_patch_height,
+        min_area_ratio=args.min_area_ratio,
+        min_context_score=args.min_context_score,
+        context_margin=args.context_margin,
+    )
     log("Writing report...")
-    write_report(output_dir, figures, panels, strips, matches)
+    write_report(
+        output_dir,
+        figures,
+        panels,
+        strips,
+        matches,
+        comparison_stats,
+        {
+            "dpi": args.dpi,
+            "min_score": args.min_score,
+            "min_patch_area": args.min_patch_area,
+            "min_patch_width": args.min_patch_width,
+            "min_patch_height": args.min_patch_height,
+            "min_area_ratio": args.min_area_ratio,
+            "min_context_score": args.min_context_score,
+            "context_margin": args.context_margin,
+            "pdf_backend": args.pdf_backend,
+        },
+    )
 
     log(f"Report: {output_dir / 'report.html'}")
     log(f"JSON: {output_dir / 'results.json'}")
