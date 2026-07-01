@@ -60,7 +60,9 @@ OCR preprocessed images, TSV, parsed word boxes, and diagnostic overlays are sav
 8. Detect WB/gel protein rows from right-side OCR labels such as `p-TBK1`, `TBK1`, `cGAS`, `STING`, and loading controls; propagate consistent row labels across matched blot panels when OCR is incomplete.
 9. Extract both strip-level and lane-local band-patch candidates from blot panels, require minimum evidence-patch size, and use high-confidence OCR text boxes to suppress text-like false positives.
 10. Compare candidates only within the same figure/category and same WB/gel protein row by normalized cross-correlation, while filtering undersized or mismatched patch pairs that are prone to false positives.
-11. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence, protein-row labels, evidence area, area ratio, and optional context score.
+11. Aggregate same-row local evidence into row-level clusters when multiple independent local matches share consistent lane offset, orientation, and surrounding-context support.
+12. Optionally run multimodal verification on aggregate evidence images with `--multimodal-verify auto` or `--multimodal-verify always`; this sends aggregate review images to the OpenAI API only when explicitly enabled and `OPENAI_API_KEY` is set.
+13. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence, aggregate evidence clusters, protein-row labels, evidence area, area ratio, optional context score, and multimodal verification status.
 
 ## Installation Dependencies
 
@@ -81,6 +83,9 @@ Use `scripts/install_dependencies.sh` or `scripts/install_dependencies.ps1` to m
 - Keep the default `--min-patch-area 450`, `--min-patch-width 18`, `--min-patch-height 12`, and `--min-area-ratio 0.55` for routine WB/gel audits. Raise `--min-patch-area` to suppress tiny-band false positives; lower it only for exploratory checks of very small bands.
 - Keep the default protein-row matching for WB/gel audits. Use `--allow-row-mismatch` only for exploratory debugging because cross-protein comparisons can surface high-scoring false positives.
 - Use `--min-context-score` only as a stricter second-pass filter. The report always records context score, but the default is `0.0` because cropped WB bands can have valid local reuse even when surrounding lanes differ.
+- Keep evidence aggregation enabled with the default `--min-aggregate-matches 2`, `--min-aggregate-context-score 0.55`, and `--min-aggregate-orientation-fraction 0.80`. These defaults require at least two one-to-one local matches with consistent orientation and enough surrounding context before promoting pairwise candidates into a row-level evidence cluster.
+- Use `--multimodal-verify auto` for a second-stage visual check of aggregate evidence when the manuscript can be sent to the OpenAI API and `OPENAI_API_KEY` is configured. Keep it `off` for confidential manuscripts unless the user explicitly approves external model review.
+- Use `--multimodal-model` to override the default OpenAI model for aggregate review.
 - Use the default `--dpi 180` for cross-platform PyMuPDF audits. Lower values such as `--dpi 150` reduce runtime but can lower small band similarity scores.
 - Use `--keep-existing` to reuse PDF layout and rendered pages while tuning segmentation/comparison.
 - Inspect `ocr/*_overlay.png` when panel labels look wrong or when OCR text-filtered strip counts are unexpectedly high.
@@ -98,3 +103,4 @@ Read `references/review-rules.md` before making a written assessment. Always des
 - Figure discovery still depends on the PDF text layer. For scanned PDFs on any platform, add page-level OCR title/caption detection before relying on this workflow.
 - The first version focuses on Western blot/gel reuse. Microscopy and flow cytometry support should be extended with category-specific extractors before relying on those classes.
 - Similar band-shaped biological signals can look alike. High scores require visual review of the highlighted context, lane identity, and caption claims.
+- Evidence aggregates are row-level support summaries, not claims that a whole WB row is pixel-identical. The report records `full_row_score` as a diagnostic so local band reuse can be distinguished from full-row duplication.

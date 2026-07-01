@@ -10,6 +10,8 @@
 
 Compare only blot-like panels with blot-like panels. Prefer local band-patch candidates over whole-panel similarity because scientific blots often reuse a single lane or band rather than the full panel. Treat same-protein-row matching as the default review boundary; cross-protein similarities are usually exploratory false-positive material unless there is independent evidence of relabeling.
 
+Use evidence aggregates as the second-stage WB review layer. An aggregate should be treated as stronger row-level support only when it contains multiple independent one-to-one local matches, consistent lane offset, consistent orientation, and adequate surrounding-context score. Do not describe an aggregate as a whole-row duplicate unless the full-row diagnostic score and visual row context also support that stronger claim.
+
 When reviewing a candidate:
 
 1. Confirm both highlighted boxes sit inside blot/gel image content, not labels, legends, axes, or captions.
@@ -18,7 +20,14 @@ When reviewing a candidate:
 4. Confirm the reported protein-row labels match the highlighted regions. If one row label was propagated from another panel, inspect the panel image and OCR overlay.
 5. Check whether the candidate appears in different panels, conditions, lanes, or experimental contexts.
 6. Report the figure/panel pair, protein row, page, score, context score, evidence area, and candidate image path.
-7. Use cautious wording: "suspicious reuse candidate" or "requires manual review."
+7. For aggregate evidence, report the independent support count, raw pairwise count, mean-top score, mean context score, dominant orientation, lane-offset consistency, full-row diagnostic score, and aggregate review image.
+8. Use cautious wording: "suspicious reuse candidate" or "requires manual review."
+
+## Multimodal Verification
+
+Use multimodal verification only as a second-stage reviewer of aggregate evidence images. It can help check whether highlighted boxes visually sit on comparable blot bands and whether the aggregate image supports localized reuse, but it must not replace numerical scoring, OCR/protein-row checks, or human review of the manuscript context.
+
+Keep multimodal verification disabled for confidential manuscripts unless external API review is approved. When enabled, record the model status, confidence, and rationale from the report; treat `uncertain`, API errors, or missing API keys as non-confirmatory rather than negative evidence.
 
 ## Common False Positives
 
@@ -27,6 +36,7 @@ When reviewing a candidate:
 - Tiny dark blobs or single-band fragments that become artificially similar after resizing.
 - Reused chart axes, legends, and plot markers.
 - Different lanes with simple, low-information bands.
+- Cross-combinations of many similar simple bands within the same protein row. These may create many raw pairwise matches but should not become aggregate findings unless independent one-to-one matches share lane offset, orientation, and context support.
 - Images derived from the same control where reuse is disclosed in the caption or methods.
 
 ## Reporting Template

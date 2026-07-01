@@ -10,6 +10,7 @@ report candidates for human review rather than definitive misconduct.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import importlib
 import json
@@ -22,6 +23,8 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Sequence
+import urllib.error
+import urllib.request
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -109,6 +112,48 @@ class MatchCandidate:
     strip_b_image: str
     review_image: str
     note: str
+
+
+@dataclass
+class EvidenceAggregate:
+    figure: str
+    page: int
+    panel_a: str
+    panel_b: str
+    row_label: str | None
+    row_label_a: str | None
+    row_label_b: str | None
+    row_index_a: int | None
+    row_index_b: int | None
+    row_match: str
+    evidence_type: str
+    level: str
+    match_count: int
+    raw_match_count: int
+    high_match_count: int
+    medium_match_count: int
+    top_score: float
+    mean_top_score: float
+    mean_score: float
+    max_context_score: float
+    mean_context_score: float
+    dominant_orientation: str
+    dominant_orientation_fraction: float
+    orientation_consistent: bool
+    lane_offset_std: float | None
+    lane_offset_consistent: bool | None
+    row_coverage_a: float | None
+    row_coverage_b: float | None
+    full_row_score: float | None
+    support_matches: list[str]
+    support_scores: list[float]
+    review_image: str
+    note: str
+    multimodal_status: str = "not-run"
+    multimodal_confidence: float | None = None
+    multimodal_rationale: str | None = None
+    multimodal_model: str | None = None
+    multimodal_error: str | None = None
 
 
 @dataclass
@@ -1623,6 +1668,212 @@ def draw_review_image(
     canvas.save(output_path)
 
 
+def strip_key(strip: StripCandidate) -> tuple[str, int, str, str]:
+    return strip.figure, strip.page, strip.panel_label, strip.strip_label
+
+
+def row_group_key(match: MatchCandidate) -> tuple[str, int, str, str, str, int | None, int | None]:
+    label = match.row_label_a if match.row_label_a and match.row_label_a == match.row_label_b else None
+    return (
+        match.figure,
+        match.page,
+        match.panel_a,
+        match.panel_b,
+        label or "",
+        match.row_index_a,
+        match.row_index_b,
+    )
+
+
+def strip_matches_row(
+    strip: StripCandidate,
+    row_label: str | None,
+    row_index: int | None,
+) -> bool:
+    if row_label is not None:
+        return strip.row_label == row_label
+    return row_index is not None and strip.row_index == row_index
+
+
+def representative_row_strip(
+    strips: Iterable[StripCandidate],
+    panel_label: str,
+    row_label: str | None,
+    row_index: int | None,
+) -> StripCandidate | None:
+    row_strips = [
+        strip
+        for strip in strips
+        if strip.panel_label == panel_label and strip_matches_row(strip, row_label, row_index)
+    ]
+    if not row_strips:
+        return None
+    return max(row_strips, key=lambda strip: (strip.bbox[2] - strip.bbox[0], box_area(strip.bbox)))
+
+
+def union_width(boxes: list[tuple[int, int, int, int]]) -> int:
+    if not boxes:
+        return 0
+    intervals = sorted((box[0], box[2]) for box in boxes if box[2] > box[0])
+    if not intervals:
+        return 0
+    total = 0
+    start, end = intervals[0]
+    for next_start, next_end in intervals[1:]:
+        if next_start <= end:
+            end = max(end, next_end)
+            continue
+        total += end - start
+        start, end = next_start, next_end
+    total += end - start
+    return total
+
+
+def coverage_for_support_boxes(
+    support_strips: list[StripCandidate],
+    row_strip: StripCandidate | None,
+) -> float | None:
+    if row_strip is None:
+        return None
+    row_width = max(1, row_strip.bbox[2] - row_strip.bbox[0])
+    coverage = union_width([strip.bbox for strip in support_strips]) / row_width
+    return round(min(1.0, coverage), 4)
+
+
+def aggregate_level(match_count: int, high_count: int, mean_top_score: float) -> str:
+    if match_count >= 2 and high_count >= 2 and mean_top_score >= 0.90:
+        return "high"
+    if match_count >= 2 and mean_top_score >= 0.82:
+        return "medium"
+    return "low"
+
+
+def match_center_offset(strip_a: StripCandidate, strip_b: StripCandidate) -> float:
+    center_a = (strip_a.bbox[0] + strip_a.bbox[2]) / 2
+    center_b = (strip_b.bbox[0] + strip_b.bbox[2]) / 2
+    return center_a - center_b
+
+
+def select_one_to_one_support(
+    matches: list[MatchCandidate],
+    strips_by_key: dict[tuple[str, int, str, str], StripCandidate],
+) -> list[tuple[MatchCandidate, StripCandidate, StripCandidate]]:
+    enriched: list[tuple[MatchCandidate, StripCandidate, StripCandidate, float]] = []
+    for match in matches:
+        strip_a = strips_by_key.get((match.figure, match.page, match.panel_a, match.strip_a))
+        strip_b = strips_by_key.get((match.figure, match.page, match.panel_b, match.strip_b))
+        if strip_a is None or strip_b is None:
+            continue
+        enriched.append((match, strip_a, strip_b, match_center_offset(strip_a, strip_b)))
+    if not enriched:
+        return []
+
+    candidate_offsets = sorted({round(item[3], 1) for item in enriched})
+    best_cluster: list[tuple[MatchCandidate, StripCandidate, StripCandidate, float]] = []
+    for offset in candidate_offsets:
+        clustered = [item for item in enriched if abs(item[3] - offset) <= 6.0]
+        selected: list[tuple[MatchCandidate, StripCandidate, StripCandidate, float]] = []
+        used_a: set[str] = set()
+        used_b: set[str] = set()
+        for item in sorted(
+            clustered,
+            key=lambda value: (value[0].score, value[0].context_score),
+            reverse=True,
+        ):
+            match = item[0]
+            if match.strip_a in used_a or match.strip_b in used_b:
+                continue
+            selected.append(item)
+            used_a.add(match.strip_a)
+            used_b.add(match.strip_b)
+        if (
+            len(selected) > len(best_cluster)
+            or (
+                len(selected) == len(best_cluster)
+                and sum(item[0].score for item in selected) > sum(item[0].score for item in best_cluster)
+            )
+        ):
+            best_cluster = selected
+
+    best_cluster.sort(key=lambda item: (item[0].score, item[0].context_score), reverse=True)
+    return [(match, strip_a, strip_b) for match, strip_a, strip_b, _ in best_cluster]
+
+
+def draw_aggregate_review_image(
+    aggregate: EvidenceAggregate,
+    support: list[tuple[MatchCandidate, StripCandidate, StripCandidate]],
+    panel_a: PanelCandidate,
+    panel_b: PanelCandidate,
+    row_strip_a: StripCandidate | None,
+    row_strip_b: StripCandidate | None,
+    output_path: Path,
+) -> None:
+    img_a = Image.open(panel_a.image_path).convert("RGB")
+    img_b = Image.open(panel_b.image_path).convert("RGB")
+    draw_a = ImageDraw.Draw(img_a)
+    draw_b = ImageDraw.Draw(img_b)
+    if row_strip_a is not None:
+        draw_a.rectangle(row_strip_a.bbox, outline=(0, 114, 178), width=3)
+    if row_strip_b is not None:
+        draw_b.rectangle(row_strip_b.bbox, outline=(0, 114, 178), width=3)
+
+    colors = [
+        (213, 94, 0),
+        (0, 158, 115),
+        (204, 121, 167),
+        (230, 159, 0),
+        (86, 180, 233),
+    ]
+    for idx, (_, strip_a, strip_b) in enumerate(support, start=1):
+        color = colors[(idx - 1) % len(colors)]
+        draw_a.rectangle(strip_a.bbox, outline=color, width=4)
+        draw_b.rectangle(strip_b.bbox, outline=color, width=4)
+        draw_a.text((strip_a.bbox[0], max(0, strip_a.bbox[1] - 14)), str(idx), fill=color)
+        draw_b.text((strip_b.bbox[0], max(0, strip_b.bbox[1] - 14)), str(idx), fill=color)
+
+    thumb_pairs: list[tuple[Image.Image, Image.Image, str]] = []
+    for idx, (match, strip_a, strip_b) in enumerate(support, start=1):
+        thumb_a = Image.open(strip_a.image_path).convert("RGB")
+        thumb_b = Image.open(strip_b.image_path).convert("RGB")
+        target_h = 34
+        for thumb in (thumb_a, thumb_b):
+            thumb.thumbnail((160, target_h), Image.Resampling.BICUBIC)
+        thumb_pairs.append((thumb_a.copy(), thumb_b.copy(), f"{idx}. {match.score:.3f}"))
+
+    max_panel_h = max(img_a.height, img_b.height)
+    thumbs_h = max(0, len(thumb_pairs) * 48)
+    canvas_w = img_a.width + img_b.width + 34
+    canvas_h = max_panel_h + thumbs_h + 92
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
+    canvas.paste(img_a, (0, 48))
+    canvas.paste(img_b, (img_a.width + 34, 48))
+    draw = ImageDraw.Draw(canvas)
+    row_label = aggregate.row_label or aggregate.row_index_a or "row"
+    draw.text(
+        (0, 10),
+        (
+            f"{aggregate.figure}{aggregate.panel_a} vs {aggregate.figure}{aggregate.panel_b} / "
+            f"{row_label} / {aggregate.match_count} local evidence items"
+        ),
+        fill=(0, 0, 0),
+    )
+    draw.text(
+        (0, 28),
+        f"top {aggregate.top_score:.3f}, mean-top {aggregate.mean_top_score:.3f}, full-row {aggregate.full_row_score}",
+        fill=(70, 70, 70),
+    )
+
+    thumb_y = max_panel_h + 62
+    for thumb_a, thumb_b, label in thumb_pairs:
+        draw.text((0, thumb_y + 8), label, fill=(0, 0, 0))
+        canvas.paste(thumb_a, (72, thumb_y))
+        canvas.paste(thumb_b, (72 + 174, thumb_y))
+        thumb_y += 48
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
 def compare_strips(
     panels: list[PanelCandidate],
     strips: list[StripCandidate],
@@ -1732,6 +1983,345 @@ def compare_strips(
     return [match for match, _, _, _, _ in top_candidates], stats
 
 
+def best_full_row_score(
+    panel_a: PanelCandidate,
+    panel_b: PanelCandidate,
+    strips: list[StripCandidate],
+    row_label: str | None,
+    row_index_a: int | None,
+    row_index_b: int | None,
+) -> tuple[float | None, StripCandidate | None, StripCandidate | None]:
+    min_width_a = max(60, int((panel_a.bbox[2] - panel_a.bbox[0]) * 0.30))
+    min_width_b = max(60, int((panel_b.bbox[2] - panel_b.bbox[0]) * 0.30))
+    candidates_a = [
+        strip
+        for strip in strips
+        if strip.panel_label == panel_a.label
+        and strip_matches_row(strip, row_label, row_index_a)
+        and (strip.bbox[2] - strip.bbox[0]) >= min_width_a
+    ]
+    candidates_b = [
+        strip
+        for strip in strips
+        if strip.panel_label == panel_b.label
+        and strip_matches_row(strip, row_label, row_index_b)
+        and (strip.bbox[2] - strip.bbox[0]) >= min_width_b
+    ]
+    if not candidates_a:
+        fallback = representative_row_strip(strips, panel_a.label, row_label, row_index_a)
+        candidates_a = [fallback] if fallback is not None else []
+    if not candidates_b:
+        fallback = representative_row_strip(strips, panel_b.label, row_label, row_index_b)
+        candidates_b = [fallback] if fallback is not None else []
+    if not candidates_a or not candidates_b:
+        return None, None, None
+
+    best_score = -1.0
+    best_a: StripCandidate | None = None
+    best_b: StripCandidate | None = None
+    for strip_a in candidates_a:
+        for strip_b in candidates_b:
+            score, _ = strip_similarity(strip_a.image_path, strip_b.image_path)
+            if score > best_score:
+                best_score = score
+                best_a = strip_a
+                best_b = strip_b
+    return round(best_score, 4), best_a, best_b
+
+
+def aggregate_evidence(
+    panels: list[PanelCandidate],
+    strips: list[StripCandidate],
+    matches: list[MatchCandidate],
+    aggregates_dir: Path,
+    min_aggregate_matches: int,
+    aggregate_top_k: int,
+    min_aggregate_context_score: float,
+    min_aggregate_orientation_fraction: float,
+) -> list[EvidenceAggregate]:
+    if min_aggregate_matches <= 1:
+        min_aggregate_matches = 1
+    if aggregate_top_k <= 0:
+        aggregate_top_k = 1
+
+    panels_by_key = {(panel.figure, panel.page, panel.label): panel for panel in panels}
+    strips_by_key = {strip_key(strip): strip for strip in strips}
+    grouped: dict[tuple[str, int, str, str, str, int | None, int | None], list[MatchCandidate]] = {}
+    for match in matches:
+        grouped.setdefault(row_group_key(match), []).append(match)
+
+    aggregates: list[EvidenceAggregate] = []
+    for group_key, group_matches in grouped.items():
+        raw_match_count = len(group_matches)
+        if raw_match_count < min_aggregate_matches:
+            continue
+        figure, page, panel_a_label, panel_b_label, common_row_label, row_index_a, row_index_b = group_key
+        panel_a = panels_by_key.get((figure, page, panel_a_label))
+        panel_b = panels_by_key.get((figure, page, panel_b_label))
+        if panel_a is None or panel_b is None:
+            continue
+
+        sorted_matches = sorted(group_matches, key=lambda match: (match.score, match.context_score), reverse=True)
+        support = select_one_to_one_support(sorted_matches, strips_by_key)
+        if len(support) < min_aggregate_matches:
+            continue
+        support = support[:aggregate_top_k]
+        support_matches = [match for match, _, _ in support]
+
+        row_label = common_row_label or None
+        scores = [match.score for match in support_matches]
+        context_scores = [match.context_score for match in support_matches]
+        top_scores = scores[: min(3, len(scores))]
+        high_count = sum(1 for score in scores if score >= 0.90)
+        medium_count = sum(1 for score in scores if 0.82 <= score < 0.90)
+        orientation_counts: dict[str, int] = {}
+        for match in support_matches:
+            orientation_counts[match.orientation] = orientation_counts.get(match.orientation, 0) + 1
+        dominant_orientation, dominant_count = max(
+            orientation_counts.items(),
+            key=lambda item: (item[1], item[0] == "none"),
+        )
+        dominant_orientation_fraction = round(dominant_count / len(support_matches), 4)
+        orientation_consistent = dominant_orientation_fraction >= min_aggregate_orientation_fraction
+        offsets = [match_center_offset(strip_a, strip_b) for _, strip_a, strip_b in support]
+        lane_offset_std = round(float(np.std(offsets)), 4) if len(offsets) >= 2 else None
+        lane_offset_consistent = lane_offset_std is not None and lane_offset_std <= 6.0
+        full_row_score, row_strip_a, row_strip_b = best_full_row_score(
+            panel_a,
+            panel_b,
+            strips,
+            row_label,
+            row_index_a,
+            row_index_b,
+        )
+        row_strip_a = row_strip_a or representative_row_strip(strips, panel_a_label, row_label, row_index_a)
+        row_strip_b = row_strip_b or representative_row_strip(strips, panel_b_label, row_label, row_index_b)
+        support_strips_a = [strip_a for _, strip_a, _ in support]
+        support_strips_b = [strip_b for _, _, strip_b in support]
+        row_coverage_a = coverage_for_support_boxes(support_strips_a, row_strip_a)
+        row_coverage_b = coverage_for_support_boxes(support_strips_b, row_strip_b)
+        mean_top = round(float(sum(top_scores) / len(top_scores)), 4)
+        mean_context = round(float(sum(context_scores) / len(context_scores)), 4)
+        if mean_context < min_aggregate_context_score or not orientation_consistent:
+            continue
+        level = aggregate_level(len(support_matches), high_count, mean_top)
+        review_name = (
+            f"{figure.lower().replace(' ', '-')}_aggregate_"
+            f"{row_label or 'row'}_{panel_a_label}_vs_{panel_b_label}.png"
+        )
+        review_path = aggregates_dir / review_name
+        note = (
+            "Evidence aggregate derived from multiple same-protein-row local WB/gel matches. "
+            "Use this as row-level support for localized reuse, not as proof that the entire row is pixel-identical."
+        )
+        aggregate = EvidenceAggregate(
+            figure=figure,
+            page=page,
+            panel_a=panel_a_label,
+            panel_b=panel_b_label,
+            row_label=row_label,
+            row_label_a=support_matches[0].row_label_a,
+            row_label_b=support_matches[0].row_label_b,
+            row_index_a=row_index_a,
+            row_index_b=row_index_b,
+            row_match=support_matches[0].row_match,
+            evidence_type="row-local-cluster",
+            level=level,
+            match_count=len(support_matches),
+            raw_match_count=raw_match_count,
+            high_match_count=high_count,
+            medium_match_count=medium_count,
+            top_score=round(scores[0], 4),
+            mean_top_score=mean_top,
+            mean_score=round(float(sum(scores) / len(scores)), 4),
+            max_context_score=round(max(context_scores), 4),
+            mean_context_score=mean_context,
+            dominant_orientation=dominant_orientation,
+            dominant_orientation_fraction=dominant_orientation_fraction,
+            orientation_consistent=orientation_consistent,
+            lane_offset_std=lane_offset_std,
+            lane_offset_consistent=lane_offset_consistent,
+            row_coverage_a=row_coverage_a,
+            row_coverage_b=row_coverage_b,
+            full_row_score=full_row_score,
+            support_matches=[f"{match.strip_a} vs {match.strip_b}" for match in support_matches],
+            support_scores=[round(match.score, 4) for match in support_matches],
+            review_image=str(review_path),
+            note=note,
+        )
+        draw_aggregate_review_image(
+            aggregate,
+            support,
+            panel_a,
+            panel_b,
+            row_strip_a,
+            row_strip_b,
+            review_path,
+        )
+        aggregates.append(aggregate)
+
+    aggregates.sort(
+        key=lambda aggregate: (
+            {"high": 2, "medium": 1, "low": 0}.get(aggregate.level, 0),
+            aggregate.match_count,
+            aggregate.mean_top_score,
+            aggregate.top_score,
+        ),
+        reverse=True,
+    )
+    return aggregates
+
+
+def extract_response_text(response: dict) -> str:
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    texts: list[str] = []
+    for item in response.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def parse_json_object(text: str) -> dict | None:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.S)
+    if match is None:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def verify_aggregate_with_openai(
+    aggregate: EvidenceAggregate,
+    api_key: str,
+    model: str,
+    timeout: int,
+) -> None:
+    image_path = Path(aggregate.review_image)
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    prompt = (
+        "You are reviewing a Western blot image-duplication triage result. "
+        "The image shows two figure panels with colored boxes marking multiple local candidate matches in the same protein row, "
+        "and thumbnails of the local evidence. Assess whether the highlighted local patches visually support suspicious localized reuse. "
+        "Do not claim misconduct or whole-row identity. Return JSON only with keys: "
+        "status (supports, uncertain, does_not_support), confidence (0 to 1), rationale (brief). "
+        f"Candidate metadata: figure={aggregate.figure}, panels={aggregate.panel_a} vs {aggregate.panel_b}, "
+        f"row={aggregate.row_label or aggregate.row_index_a}, independent_local_matches={aggregate.match_count}, "
+        f"raw_pairwise_matches={aggregate.raw_match_count}, "
+        f"top_score={aggregate.top_score}, mean_top_score={aggregate.mean_top_score}, "
+        f"full_row_score={aggregate.full_row_score}."
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_b64}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+        "max_output_tokens": 300,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        aggregate.multimodal_status = "error"
+        aggregate.multimodal_model = model
+        aggregate.multimodal_error = f"HTTP {exc.code}: {detail[:500]}"
+        return
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        aggregate.multimodal_status = "error"
+        aggregate.multimodal_model = model
+        aggregate.multimodal_error = str(exc)
+        return
+
+    try:
+        parsed_response = json.loads(body)
+    except json.JSONDecodeError:
+        aggregate.multimodal_status = "error"
+        aggregate.multimodal_model = model
+        aggregate.multimodal_error = f"Non-JSON API response: {body[:500]}"
+        return
+
+    text = extract_response_text(parsed_response)
+    parsed = parse_json_object(text)
+    if parsed is None:
+        aggregate.multimodal_status = "uncertain"
+        aggregate.multimodal_model = model
+        aggregate.multimodal_rationale = text[:1000] if text else "No parseable model text."
+        return
+
+    status = str(parsed.get("status", "uncertain")).strip().lower()
+    if status not in {"supports", "uncertain", "does_not_support"}:
+        status = "uncertain"
+    confidence = parsed.get("confidence")
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        confidence_value = None
+    if confidence_value is not None:
+        confidence_value = max(0.0, min(1.0, confidence_value))
+    aggregate.multimodal_status = status
+    aggregate.multimodal_confidence = round(confidence_value, 3) if confidence_value is not None else None
+    aggregate.multimodal_rationale = str(parsed.get("rationale", "")).strip()[:1000]
+    aggregate.multimodal_model = model
+
+
+def run_multimodal_verification(
+    aggregates: list[EvidenceAggregate],
+    mode: str,
+    model: str,
+    max_aggregates: int,
+    timeout: int,
+) -> None:
+    if mode == "off":
+        return
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        if mode == "always":
+            log("Multimodal verification note: OPENAI_API_KEY is not set; verification was requested but cannot run.")
+        for aggregate in aggregates[:max_aggregates]:
+            aggregate.multimodal_status = "skipped"
+            aggregate.multimodal_model = model
+            aggregate.multimodal_error = "OPENAI_API_KEY is not set."
+        return
+    for aggregate in aggregates[:max_aggregates]:
+        verify_aggregate_with_openai(aggregate, api_key, model, timeout)
+
+
 def relative_to(path: str | Path, root: Path) -> str:
     return os.path.relpath(str(path), str(root))
 
@@ -1742,12 +2332,17 @@ def reset_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def optional_float(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.4f}"
+
+
 def write_report(
     output_dir: Path,
     figures: list[FigureCandidate],
     panels: list[PanelCandidate],
     strips: list[StripCandidate],
     matches: list[MatchCandidate],
+    aggregates: list[EvidenceAggregate],
     comparison_stats: ComparisonStats,
     settings: dict[str, float | int | str],
 ) -> None:
@@ -1761,6 +2356,7 @@ def write_report(
         "panels": [asdict(p) for p in panels],
         "strips": [asdict(s) for s in strips],
         "matches": [asdict(m) for m in matches],
+        "evidence_aggregates": [asdict(a) for a in aggregates],
     }
     (output_dir / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2),
@@ -1777,6 +2373,7 @@ def write_report(
         f"- OCR text-filtered strip candidates: {text_filtered_strip_count}",
         f"- Small WB/gel patch candidates filtered: {small_filtered_strip_count}",
         f"- Suspicious candidates: {len(matches)}",
+        f"- Evidence aggregates: {len(aggregates)}",
         f"- Pairwise comparisons considered: {comparison_stats.pairs_considered}",
         f"- Pairs skipped for protein-row mismatch: {comparison_stats.pairs_skipped_row_mismatch}",
         f"- Pairs skipped for missing/partial protein-row labels: {comparison_stats.pairs_skipped_row_unknown}",
@@ -1784,9 +2381,45 @@ def write_report(
         f"- Pairs skipped for size mismatch: {comparison_stats.pairs_skipped_size_mismatch}",
         f"- Pairs skipped for context threshold: {comparison_stats.pairs_skipped_context}",
         "",
-        "## Suspicious Candidates",
+        "## Evidence Aggregates",
         "",
     ]
+    if not aggregates:
+        md_lines.append("No aggregate evidence clusters met the configured threshold.")
+    for aggregate in aggregates:
+        rel_review = relative_to(aggregate.review_image, output_dir)
+        multimodal_line = aggregate.multimodal_status
+        if aggregate.multimodal_confidence is not None:
+            multimodal_line += f" ({aggregate.multimodal_confidence:.3f})"
+        md_lines.extend(
+            [
+                f"### {aggregate.level.upper()} {aggregate.figure}{aggregate.panel_a} vs {aggregate.figure}{aggregate.panel_b}",
+                "",
+                f"- Page: {aggregate.page}",
+                f"- Evidence type: {aggregate.evidence_type}",
+                f"- Protein row: {aggregate.row_label or aggregate.row_index_a} vs {aggregate.row_label or aggregate.row_index_b} ({aggregate.row_match})",
+                f"- Local support: {aggregate.match_count} independent matches from {aggregate.raw_match_count} raw pairwise matches; high {aggregate.high_match_count}; medium {aggregate.medium_match_count}",
+                f"- Scores: top {aggregate.top_score:.4f}; mean-top {aggregate.mean_top_score:.4f}; mean {aggregate.mean_score:.4f}",
+                f"- Context: max {aggregate.max_context_score:.4f}; mean {aggregate.mean_context_score:.4f}",
+                f"- Dominant orientation: {aggregate.dominant_orientation} ({aggregate.dominant_orientation_fraction:.4f})",
+                f"- Full-row diagnostic score: {optional_float(aggregate.full_row_score)}",
+                f"- Row coverage: {optional_float(aggregate.row_coverage_a)} vs {optional_float(aggregate.row_coverage_b)}",
+                f"- Lane-offset consistent: {aggregate.lane_offset_consistent} (std {optional_float(aggregate.lane_offset_std)})",
+                f"- Support matches: {', '.join(aggregate.support_matches)}",
+                f"- Multimodal verification: {multimodal_line}",
+                f"- Multimodal rationale: {aggregate.multimodal_rationale or aggregate.multimodal_error or 'n/a'}",
+                f"- Note: {aggregate.note}",
+                "",
+                f"![aggregate review]({rel_review})",
+                "",
+            ]
+        )
+    md_lines.extend(
+        [
+        "## Suspicious Candidates",
+        "",
+        ]
+    )
     if not matches:
         md_lines.append("No candidates passed the configured threshold.")
     for match in matches:
@@ -1810,6 +2443,38 @@ def write_report(
             ]
         )
     (output_dir / "report.md").write_text("\n".join(md_lines), encoding="utf-8")
+
+    aggregate_rows = []
+    for aggregate in aggregates:
+        rel_review = html.escape(relative_to(aggregate.review_image, output_dir))
+        multimodal = html.escape(aggregate.multimodal_status)
+        if aggregate.multimodal_confidence is not None:
+            multimodal += f"<br>{aggregate.multimodal_confidence:.3f}"
+        rationale = aggregate.multimodal_rationale or aggregate.multimodal_error or ""
+        aggregate_rows.append(
+            "<tr>"
+            f"<td>{html.escape(aggregate.level)}</td>"
+            f"<td>{html.escape(aggregate.figure)}{html.escape(aggregate.panel_a)} vs "
+            f"{html.escape(aggregate.figure)}{html.escape(aggregate.panel_b)}</td>"
+            f"<td>{aggregate.page}</td>"
+            f"<td>{html.escape(str(aggregate.row_label or aggregate.row_index_a))}<br>{html.escape(aggregate.row_match)}</td>"
+            f"<td>{aggregate.match_count} independent<br>{aggregate.raw_match_count} raw<br>high {aggregate.high_match_count}, medium {aggregate.medium_match_count}</td>"
+            f"<td>top {aggregate.top_score:.4f}<br>mean-top {aggregate.mean_top_score:.4f}<br>mean {aggregate.mean_score:.4f}</td>"
+            f"<td>max {aggregate.max_context_score:.4f}<br>mean {aggregate.mean_context_score:.4f}</td>"
+            f"<td>{html.escape(aggregate.dominant_orientation)}<br>{aggregate.dominant_orientation_fraction:.3f}</td>"
+            f"<td>{html.escape(optional_float(aggregate.full_row_score))}</td>"
+            f"<td>{html.escape(optional_float(aggregate.row_coverage_a))} / "
+            f"{html.escape(optional_float(aggregate.row_coverage_b))}<br>"
+            f"offset std {html.escape(optional_float(aggregate.lane_offset_std))}</td>"
+            f"<td>{multimodal}<br>{html.escape(rationale)}</td>"
+            f"<td><img src=\"{rel_review}\" /></td>"
+            "</tr>"
+        )
+    aggregate_body = (
+        "\n".join(aggregate_rows)
+        if aggregate_rows
+        else "<tr><td colspan=\"12\">No aggregate evidence clusters met the configured threshold.</td></tr>"
+    )
 
     rows = []
     for match in matches:
@@ -1842,6 +2507,7 @@ def write_report(
     .summary {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 24px; }}
     .metric {{ border: 1px solid #d5dae1; border-radius: 6px; padding: 10px 14px; min-width: 150px; }}
     .metric b {{ display: block; font-size: 24px; }}
+    h2 {{ margin-top: 28px; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border-top: 1px solid #d5dae1; padding: 10px; text-align: left; vertical-align: top; }}
     th {{ background: #f4f6f8; }}
@@ -1860,11 +2526,23 @@ def write_report(
     <div class="metric"><b>{text_filtered_strip_count}</b>OCR text-filtered strips</div>
     <div class="metric"><b>{small_filtered_strip_count}</b>Small patches filtered</div>
     <div class="metric"><b>{len(matches)}</b>Suspicious candidates</div>
+    <div class="metric"><b>{len(aggregates)}</b>Evidence aggregates</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_row_mismatch}</b>Protein-row mismatches skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_row_unknown}</b>Unknown-row pairs skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_small}</b>Small-patch pairs skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_size_mismatch}</b>Size-mismatch pairs skipped</div>
   </div>
+  <h2>Evidence Aggregates</h2>
+  <p class="note">Aggregates group multiple local same-row matches into row-level support. A low full-row score can still be compatible with localized band reuse; it means the entire row is not pixel-identical.</p>
+  <table>
+    <thead>
+      <tr><th>Level</th><th>Panels</th><th>Page</th><th>Protein Row</th><th>Support</th><th>Scores</th><th>Context</th><th>Orientation</th><th>Full Row</th><th>Coverage</th><th>Multimodal</th><th>Review</th></tr>
+    </thead>
+    <tbody>
+      {aggregate_body}
+    </tbody>
+  </table>
+  <h2>Suspicious Candidates</h2>
   <table>
     <thead>
       <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Protein Row</th><th>Score</th><th>Context</th><th>Evidence Area</th><th>Orientation</th><th>Review</th></tr>
@@ -1928,6 +2606,53 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Exploratory mode: compare WB/gel candidates even when protein-row labels or row indices differ",
     )
+    parser.add_argument(
+        "--min-aggregate-matches",
+        type=int,
+        default=2,
+        help="Minimum same-row local matches needed to create a row-level evidence aggregate",
+    )
+    parser.add_argument(
+        "--aggregate-top-k",
+        type=int,
+        default=5,
+        help="Maximum local matches displayed in each aggregate evidence review image",
+    )
+    parser.add_argument(
+        "--min-aggregate-context-score",
+        type=float,
+        default=0.55,
+        help="Minimum mean context score for a row-level evidence aggregate",
+    )
+    parser.add_argument(
+        "--min-aggregate-orientation-fraction",
+        type=float,
+        default=0.80,
+        help="Minimum fraction of independent aggregate matches sharing the same orientation",
+    )
+    parser.add_argument(
+        "--multimodal-verify",
+        choices=("off", "auto", "always"),
+        default="off",
+        help="Use an OpenAI multimodal model to verify aggregate evidence images; auto/always require OPENAI_API_KEY",
+    )
+    parser.add_argument(
+        "--multimodal-model",
+        default="gpt-5.5",
+        help="OpenAI multimodal model used when --multimodal-verify is auto or always",
+    )
+    parser.add_argument(
+        "--multimodal-max-aggregates",
+        type=int,
+        default=5,
+        help="Maximum aggregate evidence images sent for multimodal verification",
+    )
+    parser.add_argument(
+        "--multimodal-timeout",
+        type=int,
+        default=60,
+        help="Timeout in seconds for each multimodal verification request",
+    )
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing rendered pages/layout when present")
     parser.add_argument(
         "--pdf-backend",
@@ -1963,7 +2688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log(f"Rendering page(s): {page_spec}")
         render_pages(pdf_path, pages_dir, args.dpi, page_spec, args.pdf_backend)
 
-    for derived_dir in ("figures", "panels", "strips", "matches", "ocr"):
+    for derived_dir in ("figures", "panels", "strips", "matches", "aggregates", "ocr"):
         reset_dir(output_dir / derived_dir)
 
     log("Cropping figure regions...")
@@ -1993,6 +2718,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         context_margin=args.context_margin,
         require_row_match=not args.allow_row_mismatch,
     )
+    log("Aggregating evidence...")
+    aggregates = aggregate_evidence(
+        panels,
+        strips,
+        matches,
+        output_dir / "aggregates",
+        min_aggregate_matches=args.min_aggregate_matches,
+        aggregate_top_k=args.aggregate_top_k,
+        min_aggregate_context_score=args.min_aggregate_context_score,
+        min_aggregate_orientation_fraction=args.min_aggregate_orientation_fraction,
+    )
+    if args.multimodal_verify != "off":
+        log("Running multimodal aggregate verification...")
+        run_multimodal_verification(
+            aggregates,
+            args.multimodal_verify,
+            args.multimodal_model,
+            max(0, args.multimodal_max_aggregates),
+            args.multimodal_timeout,
+        )
     log("Writing report...")
     write_report(
         output_dir,
@@ -2000,6 +2745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         panels,
         strips,
         matches,
+        aggregates,
         comparison_stats,
         {
             "dpi": args.dpi,
@@ -2011,6 +2757,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "min_context_score": args.min_context_score,
             "context_margin": args.context_margin,
             "require_row_match": not args.allow_row_mismatch,
+            "min_aggregate_matches": args.min_aggregate_matches,
+            "aggregate_top_k": args.aggregate_top_k,
+            "min_aggregate_context_score": args.min_aggregate_context_score,
+            "min_aggregate_orientation_fraction": args.min_aggregate_orientation_fraction,
+            "multimodal_verify": args.multimodal_verify,
+            "multimodal_model": args.multimodal_model,
+            "multimodal_max_aggregates": args.multimodal_max_aggregates,
             "pdf_backend": args.pdf_backend,
         },
     )
