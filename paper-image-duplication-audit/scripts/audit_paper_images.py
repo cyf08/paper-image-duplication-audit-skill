@@ -41,6 +41,15 @@ class FigureCandidate:
 
 
 @dataclass
+class ProteinRow:
+    index: int
+    label: str | None
+    center_y: float
+    source: str
+    confidence: float | None
+
+
+@dataclass
 class PanelCandidate:
     figure: str
     page: int
@@ -56,6 +65,7 @@ class PanelCandidate:
     strip_count: int
     text_filtered_strip_count: int
     small_filtered_strip_count: int
+    protein_rows: list[ProteinRow]
 
 
 @dataclass
@@ -67,6 +77,10 @@ class StripCandidate:
     bbox: tuple[int, int, int, int]
     image_path: str
     variance: float
+    row_label: str | None
+    row_index: int | None
+    row_distance: float | None
+    row_source: str | None
 
 
 @dataclass
@@ -77,6 +91,11 @@ class MatchCandidate:
     panel_b: str
     strip_a: str
     strip_b: str
+    row_label_a: str | None
+    row_label_b: str | None
+    row_index_a: int | None
+    row_index_b: int | None
+    row_match: str
     score: float
     context_score: float
     orientation: str
@@ -109,6 +128,8 @@ class StripExtractionResult:
 @dataclass
 class ComparisonStats:
     pairs_considered: int = 0
+    pairs_skipped_row_mismatch: int = 0
+    pairs_skipped_row_unknown: int = 0
     pairs_skipped_small: int = 0
     pairs_skipped_size_mismatch: int = 0
     pairs_skipped_context: int = 0
@@ -843,6 +864,35 @@ def normalize_panel_label(text: str) -> str | None:
     return None
 
 
+def normalize_protein_label(text: str, *, allow_short_cgas: bool = False) -> str | None:
+    compact = re.sub(r"[^A-Za-z0-9αΑ-]", "", text).replace("α", "a").replace("Α", "A")
+    upper = compact.upper().replace("-", "")
+    if not upper:
+        return None
+
+    if "PTBK1" in upper or upper.endswith("PTBK") or "PPTBK1" in upper:
+        return "p-TBK1"
+    if "TBK1" in upper:
+        return "TBK1"
+    if "CGAS" in upper or upper.endswith("GAS") or (allow_short_cgas and upper == "AS"):
+        return "cGAS"
+    if "STING" in upper:
+        return "STING"
+    if "ANT2" in upper:
+        return "ANT2"
+    if "SPG7" in upper:
+        return "SPG7"
+    if "CYPD" in upper:
+        return "CypD"
+    if "TUBULIN" in upper:
+        return "tubulin"
+    if "GAPDH" in upper:
+        return "GAPDH"
+    if "ACTIN" in upper:
+        return "actin"
+    return None
+
+
 def has_text_signal(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if len(compact) >= 2:
@@ -853,6 +903,10 @@ def has_text_signal(text: str) -> bool:
 def word_center(word: OcrWord) -> tuple[float, float]:
     x0, y0, x1, y1 = word.bbox
     return (x0 + x1) / 2, (y0 + y1) / 2
+
+
+def box_center_y(box: tuple[int, int, int, int]) -> float:
+    return (box[1] + box[3]) / 2
 
 
 def assign_panel_labels(
@@ -926,6 +980,171 @@ def words_for_box(
             )
         )
     return selected
+
+
+def detect_blot_row_centers(panel: Image.Image) -> list[float]:
+    roi = detect_blot_roi(panel)
+    if roi is None:
+        return []
+    gray = np.array(panel.convert("L"))
+    x0, y0, x1, y1 = roi
+    roi_gray = gray[y0:y1, x0:x1]
+    edge_mask = roi_gray < 235
+    row_projection = edge_mask.sum(axis=1)
+    threshold = max(12, (x1 - x0) * 0.62)
+    intervals = intervals_from_projection(
+        row_projection,
+        threshold=threshold,
+        merge_gap=1,
+        min_len=2,
+    )
+
+    centers: list[float] = []
+    for top, bottom in intervals:
+        center = y0 + (top + bottom) / 2
+        if not centers or abs(center - centers[-1]) >= 12:
+            centers.append(center)
+    return centers
+
+
+def detect_protein_rows(panel: Image.Image, words: list[OcrWord]) -> list[ProteinRow]:
+    roi = detect_blot_roi(panel)
+    image_width, _ = panel.size
+    row_centers = detect_blot_row_centers(panel)
+    label_candidates: list[tuple[float, str, str, float]] = []
+    if roi is not None:
+        x0, _, x1, _ = roi
+        right_label_min = x0 + (x1 - x0) * 0.72
+        right_label_max = min(image_width + 40, x1 + max(80, int(image_width * 0.35)))
+    else:
+        right_label_min = image_width * 0.55
+        right_label_max = image_width + 40
+
+    for word in words:
+        if word.confidence < 20:
+            continue
+        wcx, wcy = word_center(word)
+        if not (right_label_min <= wcx <= right_label_max):
+            continue
+        label = normalize_protein_label(word.text, allow_short_cgas=True)
+        if label is None:
+            continue
+        label_candidates.append((wcy, label, "ocr", word.confidence))
+
+    rows: list[ProteinRow] = []
+    used_candidates: set[int] = set()
+    label_for_center: dict[int, tuple[str, str, float]] = {}
+    possible_matches: list[tuple[float, float, int, int]] = []
+    for center_idx, center in enumerate(row_centers):
+        for candidate_idx, candidate in enumerate(label_candidates):
+            distance = abs(candidate[0] - center)
+            if distance <= 12:
+                possible_matches.append((distance, -candidate[3], center_idx, candidate_idx))
+    used_centers: set[int] = set()
+    for _, _, center_idx, candidate_idx in sorted(possible_matches):
+        if center_idx in used_centers or candidate_idx in used_candidates:
+            continue
+        _, label, source, confidence = label_candidates[candidate_idx]
+        label_for_center[center_idx] = (label, source, confidence)
+        used_centers.add(center_idx)
+        used_candidates.add(candidate_idx)
+
+    for center_idx, center in enumerate(row_centers):
+        label = None
+        source = "image"
+        confidence = None
+        if center_idx in label_for_center:
+            label, source, confidence = label_for_center[center_idx]
+        rows.append(
+            ProteinRow(
+                index=len(rows),
+                label=label,
+                center_y=round(center, 2),
+                source=source,
+                confidence=round(confidence, 2) if confidence is not None else None,
+            )
+        )
+
+    for idx, (center, label, source, confidence) in enumerate(label_candidates):
+        if idx in used_candidates:
+            continue
+        if any(abs(center - row.center_y) <= 14 for row in rows):
+            continue
+        rows.append(
+            ProteinRow(
+                index=len(rows),
+                label=label,
+                center_y=round(center, 2),
+                source=source,
+                confidence=round(confidence, 2),
+            )
+        )
+
+    rows.sort(key=lambda row: row.center_y)
+    for index, row in enumerate(rows):
+        row.index = index
+    return rows
+
+
+def assign_strip_row(
+    strip_box: tuple[int, int, int, int],
+    rows: list[ProteinRow],
+) -> tuple[str | None, int | None, float | None, str | None]:
+    if not rows:
+        return None, None, None, None
+    center = box_center_y(strip_box)
+    best = min(rows, key=lambda row: abs(center - row.center_y))
+    distance = abs(center - best.center_y)
+    if distance > 22:
+        return None, None, round(distance, 2), None
+    return best.label, best.index, round(distance, 2), best.source
+
+
+def propagate_protein_row_labels(panels: list[PanelCandidate], strips: list[StripCandidate]) -> None:
+    panels_by_key = {(panel.figure, panel.page, panel.label): panel for panel in panels}
+    panels_by_figure: dict[tuple[str, int], list[PanelCandidate]] = {}
+    for panel in panels:
+        if panel.category == "blot":
+            panels_by_figure.setdefault((panel.figure, panel.page), []).append(panel)
+
+    for figure_panels in panels_by_figure.values():
+        labels_by_index: dict[int, list[str]] = {}
+        for panel in figure_panels:
+            for row in panel.protein_rows:
+                if row.label:
+                    labels_by_index.setdefault(row.index, []).append(row.label)
+
+        propagated: dict[int, str] = {}
+        for row_index, labels in labels_by_index.items():
+            unique = set(labels)
+            if len(unique) == 1:
+                propagated[row_index] = labels[0]
+
+        for panel in figure_panels:
+            existing_labels = {
+                row.label
+                for row in panel.protein_rows
+                if row.label is not None
+            }
+            for row in panel.protein_rows:
+                if row.label is None and row.index in propagated:
+                    label = propagated[row.index]
+                    if label in existing_labels:
+                        continue
+                    row.label = label
+                    row.source = "propagated"
+                    row.confidence = None
+
+    for strip in strips:
+        if strip.row_label is not None or strip.row_index is None:
+            continue
+        panel = panels_by_key.get((strip.figure, strip.page, strip.panel_label))
+        if panel is None or strip.row_index >= len(panel.protein_rows):
+            continue
+        row = panel.protein_rows[strip.row_index]
+        if row.label:
+            strip.row_label = row.label
+            strip.row_source = row.source
 
 
 def is_ocr_text_region(
@@ -1084,6 +1303,50 @@ def extract_strips(
             continue
         candidates.append((box, variance + dark_fraction * 20.0))
 
+    for row_center in detect_blot_row_centers(panel):
+        row_half_height = max(9, min(15, int(roi_h / 16)))
+        row_y0 = max(y0, int(round(row_center - row_half_height)))
+        row_y1 = min(y1, int(round(row_center + row_half_height)))
+        if row_y1 - row_y0 < min_patch_height:
+            continue
+        row_gray = gray[row_y0:row_y1, x0:x1]
+        row_mask = row_gray < 205
+        row_mask[row_mask.sum(axis=1) > max(12, row_mask.shape[1] * 0.58), :] = False
+        if row_mask.size == 0:
+            continue
+        col_projection = smooth(row_mask.sum(axis=0), 5)
+        lane_threshold = max(2.0, row_mask.shape[0] * 0.08)
+        lane_intervals = intervals_from_projection(
+            col_projection,
+            threshold=lane_threshold,
+            merge_gap=2,
+            min_len=3,
+        )
+        for lane_x0, lane_x1 in lane_intervals:
+            if lane_x0 <= 5 or lane_x1 >= row_mask.shape[1] - 5:
+                continue
+            width = max(min_patch_width, min(36, lane_x1 - lane_x0 + 14))
+            center_x = x0 + (lane_x0 + lane_x1) // 2
+            center_y = int(round(row_center))
+            box = (
+                max(0, center_x - width // 2),
+                max(0, center_y - min_patch_height // 2 - 3),
+                min(gray.shape[1], center_x + (width + 1) // 2),
+                min(gray.shape[0], center_y + min_patch_height // 2 + 4),
+            )
+            if not has_minimum_evidence(box, min_patch_area, min_patch_width, min_patch_height):
+                small_filtered_count += 1
+                continue
+            patch = gray[box[1] : box[3], box[0] : box[2]]
+            variance = float(np.std(patch))
+            dark_fraction = float((patch < 190).mean())
+            if variance < 5.0 or dark_fraction < 0.025:
+                continue
+            if is_ocr_text_region(box, text_words, gray.shape[1], gray.shape[0]):
+                text_filtered_count += 1
+                continue
+            candidates.append((box, variance + dark_fraction * 22.0))
+
     deduped: list[tuple[tuple[int, int, int, int], float]] = []
     for box, variance in sorted(candidates, key=lambda item: item[1], reverse=True):
         duplicate = False
@@ -1096,12 +1359,12 @@ def extract_strips(
                 continue
             inter = (ix1 - ix0) * (iy1 - iy0)
             area = min((box[2] - box[0]) * (box[3] - box[1]), (prior[2] - prior[0]) * (prior[3] - prior[1]))
-            if inter / max(1, area) > 0.65:
+            if inter / max(1, area) > 0.65 and box_area_ratio(box, prior) > 0.35:
                 duplicate = True
                 break
         if not duplicate:
             deduped.append((box, variance))
-        if len(deduped) >= 32:
+        if len(deduped) >= 48:
             break
 
     return StripExtractionResult(
@@ -1151,6 +1414,7 @@ def segment_and_save_panels(
             crop = fig_img.crop(box)
             category, colorfulness, horizontal_score = panel_features(crop)
             panel_words = words_for_box(ocr_words, box)
+            protein_rows = detect_protein_rows(crop, panel_words) if category == "blot" else []
             if category == "blot":
                 strip_result = extract_strips(
                     crop,
@@ -1180,6 +1444,7 @@ def segment_and_save_panels(
                 strip_count=len(strip_result.strips),
                 text_filtered_strip_count=strip_result.text_filtered_count,
                 small_filtered_strip_count=strip_result.small_filtered_count,
+                protein_rows=protein_rows,
             )
             panels.append(panel)
 
@@ -1187,6 +1452,7 @@ def segment_and_save_panels(
                 strip_label = f"{label}-strip-{strip_idx:02d}"
                 strip_path = strips_dir / f"{panel_name}_strip-{strip_idx:02d}.png"
                 crop.crop(strip_box).save(strip_path)
+                row_label, row_index, row_distance, row_source = assign_strip_row(strip_box, protein_rows)
                 strips.append(
                     StripCandidate(
                         figure=figure.figure,
@@ -1196,8 +1462,13 @@ def segment_and_save_panels(
                         bbox=strip_box,
                         image_path=str(strip_path),
                         variance=round(variance, 4),
+                        row_label=row_label,
+                        row_index=row_index,
+                        row_distance=row_distance,
+                        row_source=row_source,
                     )
                 )
+    propagate_protein_row_labels(panels, strips)
     return panels, strips
 
 
@@ -1292,6 +1563,27 @@ def candidate_level(score: float) -> str:
     return "low"
 
 
+def row_match_status(
+    strip_a: StripCandidate,
+    strip_b: StripCandidate,
+    require_row_match: bool,
+) -> tuple[bool, str]:
+    if not require_row_match:
+        if strip_a.row_label and strip_a.row_label == strip_b.row_label:
+            return True, "label"
+        if strip_a.row_index is not None and strip_a.row_index == strip_b.row_index:
+            return True, "row-index"
+        return True, "not-required"
+
+    if strip_a.row_label and strip_b.row_label:
+        return (strip_a.row_label == strip_b.row_label), "label"
+    if strip_a.row_label or strip_b.row_label:
+        return False, "partial-label"
+    if strip_a.row_index is not None and strip_b.row_index is not None:
+        return (strip_a.row_index == strip_b.row_index), "row-index"
+    return False, "unknown"
+
+
 def draw_review_image(
     panel_a: PanelCandidate,
     panel_b: PanelCandidate,
@@ -1319,8 +1611,14 @@ def draw_review_image(
     canvas.paste(strip_img_a, (0, strip_y))
     canvas.paste(strip_img_b, (img_a.width + 30, strip_y))
     draw = ImageDraw.Draw(canvas)
-    draw.text((0, 8), f"{panel_a.figure}{panel_a.label} / {strip_a.strip_label}", fill=(0, 0, 0))
-    draw.text((img_a.width + 30, 8), f"{panel_b.figure}{panel_b.label} / {strip_b.strip_label}", fill=(0, 0, 0))
+    row_a = f" / {strip_a.row_label}" if strip_a.row_label else ""
+    row_b = f" / {strip_b.row_label}" if strip_b.row_label else ""
+    draw.text((0, 8), f"{panel_a.figure}{panel_a.label} / {strip_a.strip_label}{row_a}", fill=(0, 0, 0))
+    draw.text(
+        (img_a.width + 30, 8),
+        f"{panel_b.figure}{panel_b.label} / {strip_b.strip_label}{row_b}",
+        fill=(0, 0, 0),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
 
@@ -1337,6 +1635,7 @@ def compare_strips(
     min_area_ratio: float,
     min_context_score: float,
     context_margin: int,
+    require_row_match: bool,
 ) -> tuple[list[MatchCandidate], ComparisonStats]:
     panels_by_key = {(p.figure, p.page, p.label): p for p in panels}
     strips_by_figure: dict[tuple[str, int], list[StripCandidate]] = {}
@@ -1365,6 +1664,13 @@ def compare_strips(
                 panel_b = panels_by_key[(figure, page, strip_b.panel_label)]
                 if panel_a.category != "blot" or panel_b.category != "blot":
                     continue
+                rows_match, row_match = row_match_status(strip_a, strip_b, require_row_match)
+                if not rows_match:
+                    if row_match in {"unknown", "partial-label"}:
+                        stats.pairs_skipped_row_unknown += 1
+                    else:
+                        stats.pairs_skipped_row_mismatch += 1
+                    continue
                 score, orientation = strip_similarity(strip_a.image_path, strip_b.image_path)
                 if score < min_score:
                     stats.pairs_below_score += 1
@@ -1375,11 +1681,12 @@ def compare_strips(
                     continue
                 review_name = (
                     f"{figure.lower().replace(' ', '-')}_"
+                    f"{strip_a.row_label or 'row'}_"
                     f"{strip_a.strip_label}_vs_{strip_b.strip_label}_{score:.3f}.png"
                 )
                 review_path = matches_dir / review_name
                 note = (
-                    "Same-category WB/gel strips pass minimum evidence-size filters and show high "
+                    "Same-protein-row WB/gel candidates pass minimum evidence-size filters and show high "
                     "normalized cross-correlation after contrast normalization."
                 )
                 match = MatchCandidate(
@@ -1389,6 +1696,11 @@ def compare_strips(
                     panel_b=strip_b.panel_label,
                     strip_a=strip_a.strip_label,
                     strip_b=strip_b.strip_label,
+                    row_label_a=strip_a.row_label,
+                    row_label_b=strip_b.row_label,
+                    row_index_a=strip_a.row_index,
+                    row_index_b=strip_b.row_index,
+                    row_match=row_match,
                     score=round(score, 4),
                     context_score=round(context_score, 4),
                     orientation=orientation,
@@ -1405,7 +1717,15 @@ def compare_strips(
                 )
                 candidates.append((match, panel_a, panel_b, strip_a, strip_b))
 
-    candidates.sort(key=lambda c: c[0].score, reverse=True)
+    row_match_priority = {"label": 2, "row-index": 1, "not-required": 0}
+    candidates.sort(
+        key=lambda c: (
+            row_match_priority.get(c[0].row_match, 0),
+            c[0].score,
+            c[0].context_score,
+        ),
+        reverse=True,
+    )
     top_candidates = candidates[:top_n]
     for match, panel_a, panel_b, strip_a, strip_b in top_candidates:
         draw_review_image(panel_a, panel_b, strip_a, strip_b, Path(match.review_image))
@@ -1458,6 +1778,8 @@ def write_report(
         f"- Small WB/gel patch candidates filtered: {small_filtered_strip_count}",
         f"- Suspicious candidates: {len(matches)}",
         f"- Pairwise comparisons considered: {comparison_stats.pairs_considered}",
+        f"- Pairs skipped for protein-row mismatch: {comparison_stats.pairs_skipped_row_mismatch}",
+        f"- Pairs skipped for missing/partial protein-row labels: {comparison_stats.pairs_skipped_row_unknown}",
         f"- Pairs skipped for small evidence patches: {comparison_stats.pairs_skipped_small}",
         f"- Pairs skipped for size mismatch: {comparison_stats.pairs_skipped_size_mismatch}",
         f"- Pairs skipped for context threshold: {comparison_stats.pairs_skipped_context}",
@@ -1475,6 +1797,7 @@ def write_report(
                 "",
                 f"- Page: {match.page}",
                 f"- Strips: {match.strip_a} vs {match.strip_b}",
+                f"- Protein rows: {match.row_label_a or match.row_index_a} vs {match.row_label_b or match.row_index_b} ({match.row_match})",
                 f"- Score: {match.score:.4f}",
                 f"- Context score: {match.context_score:.4f}",
                 f"- Evidence area: {match.evidence_area_a} px vs {match.evidence_area_b} px",
@@ -1498,6 +1821,8 @@ def write_report(
             f"{html.escape(match.figure)}{html.escape(match.panel_b)}</td>"
             f"<td>{match.page}</td>"
             f"<td>{html.escape(match.strip_a)} vs {html.escape(match.strip_b)}</td>"
+            f"<td>{html.escape(str(match.row_label_a or match.row_index_a))} vs "
+            f"{html.escape(str(match.row_label_b or match.row_index_b))}<br>{html.escape(match.row_match)}</td>"
             f"<td>{match.score:.4f}</td>"
             f"<td>{match.context_score:.4f}</td>"
             f"<td>{match.evidence_area_a} / {match.evidence_area_b}<br>ratio {match.area_ratio:.3f}</td>"
@@ -1505,7 +1830,7 @@ def write_report(
             f"<td><img src=\"{rel_review}\" /></td>"
             "</tr>"
         )
-    table_body = "\n".join(rows) if rows else "<tr><td colspan=\"9\">No candidates passed the threshold.</td></tr>"
+    table_body = "\n".join(rows) if rows else "<tr><td colspan=\"10\">No candidates passed the threshold.</td></tr>"
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1535,12 +1860,14 @@ def write_report(
     <div class="metric"><b>{text_filtered_strip_count}</b>OCR text-filtered strips</div>
     <div class="metric"><b>{small_filtered_strip_count}</b>Small patches filtered</div>
     <div class="metric"><b>{len(matches)}</b>Suspicious candidates</div>
+    <div class="metric"><b>{comparison_stats.pairs_skipped_row_mismatch}</b>Protein-row mismatches skipped</div>
+    <div class="metric"><b>{comparison_stats.pairs_skipped_row_unknown}</b>Unknown-row pairs skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_small}</b>Small-patch pairs skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_size_mismatch}</b>Size-mismatch pairs skipped</div>
   </div>
   <table>
     <thead>
-      <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Score</th><th>Context</th><th>Evidence Area</th><th>Orientation</th><th>Review</th></tr>
+      <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Protein Row</th><th>Score</th><th>Context</th><th>Evidence Area</th><th>Orientation</th><th>Review</th></tr>
     </thead>
     <tbody>
       {table_body}
@@ -1595,6 +1922,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=int,
         default=10,
         help="Pixel margin around each evidence patch used to compute context score",
+    )
+    parser.add_argument(
+        "--allow-row-mismatch",
+        action="store_true",
+        help="Exploratory mode: compare WB/gel candidates even when protein-row labels or row indices differ",
     )
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing rendered pages/layout when present")
     parser.add_argument(
@@ -1659,6 +1991,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_area_ratio=args.min_area_ratio,
         min_context_score=args.min_context_score,
         context_margin=args.context_margin,
+        require_row_match=not args.allow_row_mismatch,
     )
     log("Writing report...")
     write_report(
@@ -1677,6 +2010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "min_area_ratio": args.min_area_ratio,
             "min_context_score": args.min_context_score,
             "context_margin": args.context_margin,
+            "require_row_match": not args.allow_row_mismatch,
             "pdf_backend": args.pdf_backend,
         },
     )
