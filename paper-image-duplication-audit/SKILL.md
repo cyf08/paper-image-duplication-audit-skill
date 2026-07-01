@@ -61,8 +61,9 @@ OCR preprocessed images, TSV, parsed word boxes, and diagnostic overlays are sav
 9. Extract both strip-level and lane-local band-patch candidates from blot panels, require minimum evidence-patch size, and use high-confidence OCR text boxes to suppress text-like false positives.
 10. Compare candidates only within the same figure/category and same WB/gel protein row by normalized cross-correlation, while filtering undersized or mismatched patch pairs that are prone to false positives.
 11. Aggregate same-row local evidence into row-level clusters when multiple independent local matches share consistent lane offset, orientation, and surrounding-context support.
-12. Optionally run multimodal verification on aggregate evidence images with `--multimodal-verify auto` or `--multimodal-verify always`; this sends aggregate review images to the OpenAI API only when explicitly enabled and `OPENAI_API_KEY` is set.
-13. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence, aggregate evidence clusters, protein-row labels, evidence area, area ratio, optional context score, and multimodal verification status.
+12. Write portable multimodal review tasks under `multimodal/` so Codex, OpenClaw, or any vision-capable agent/model can inspect aggregate evidence images without requiring the audit script itself to call a model API.
+13. Optionally merge external multimodal review JSON back into the report with `--multimodal-review-json`.
+14. Generate `report.html`, `report.md`, and `results.json` with side-by-side highlighted evidence, aggregate evidence clusters, protein-row labels, evidence area, area ratio, optional context score, and multimodal review status.
 
 ## Installation Dependencies
 
@@ -84,8 +85,9 @@ Use `scripts/install_dependencies.sh` or `scripts/install_dependencies.ps1` to m
 - Keep the default protein-row matching for WB/gel audits. Use `--allow-row-mismatch` only for exploratory debugging because cross-protein comparisons can surface high-scoring false positives.
 - Use `--min-context-score` only as a stricter second-pass filter. The report always records context score, but the default is `0.0` because cropped WB bands can have valid local reuse even when surrounding lanes differ.
 - Keep evidence aggregation enabled with the default `--min-aggregate-matches 2`, `--min-aggregate-context-score 0.55`, and `--min-aggregate-orientation-fraction 0.80`. These defaults require at least two one-to-one local matches with consistent orientation and enough surrounding context before promoting pairwise candidates into a row-level evidence cluster.
-- Use `--multimodal-verify auto` for a second-stage visual check of aggregate evidence when the manuscript can be sent to the OpenAI API and `OPENAI_API_KEY` is configured. Keep it `off` for confidential manuscripts unless the user explicitly approves external model review.
-- Use `--multimodal-model` to override the default OpenAI model for aggregate review.
+- Use the generated `multimodal/multimodal_review.md` or `multimodal/multimodal_review.json` for second-stage visual review with Codex, OpenClaw, or another vision-capable agent. The script does not need to call the model API itself.
+- If an external agent returns review JSON, rerun or post-process with `--multimodal-review-json /path/to/review.json` to merge the status, confidence, and rationale into `report.html`, `report.md`, and `results.json`.
+- Keep multimodal review local to the current agent/session for confidential manuscripts unless the user explicitly approves sending images to an external or hosted model.
 - Use the default `--dpi 180` for cross-platform PyMuPDF audits. Lower values such as `--dpi 150` reduce runtime but can lower small band similarity scores.
 - Use `--keep-existing` to reuse PDF layout and rendered pages while tuning segmentation/comparison.
 - Inspect `ocr/*_overlay.png` when panel labels look wrong or when OCR text-filtered strip counts are unexpectedly high.

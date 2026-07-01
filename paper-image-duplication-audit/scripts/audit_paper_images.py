@@ -10,7 +10,6 @@ report candidates for human review rather than definitive misconduct.
 from __future__ import annotations
 
 import argparse
-import base64
 import html
 import importlib
 import json
@@ -23,8 +22,6 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Sequence
-import urllib.error
-import urllib.request
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -2172,22 +2169,6 @@ def aggregate_evidence(
     return aggregates
 
 
-def extract_response_text(response: dict) -> str:
-    if isinstance(response.get("output_text"), str):
-        return response["output_text"]
-    texts: list[str] = []
-    for item in response.get("output", []):
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []):
-            if not isinstance(content, dict):
-                continue
-            text = content.get("text")
-            if isinstance(text, str):
-                texts.append(text)
-    return "\n".join(texts).strip()
-
-
 def parse_json_object(text: str) -> dict | None:
     text = text.strip()
     if not text:
@@ -2207,87 +2188,41 @@ def parse_json_object(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def verify_aggregate_with_openai(
+def multimodal_review_prompt(aggregate: EvidenceAggregate, output_dir: Path) -> str:
+    review_image = relative_to(aggregate.review_image, output_dir)
+    return (
+        "Review this Western blot/gel image-duplication evidence aggregate with a vision-capable model. "
+        "Use the aggregate review image, not only the numeric scores. The image shows two figure panels, "
+        "a blue protein-row box, colored local evidence boxes, and local evidence thumbnails. "
+        "Assess whether the highlighted local patches visually support suspicious localized reuse in the same protein row. "
+        "Do not claim misconduct. Do not claim whole-row duplication unless the full-row diagnostic score and visible row context support it. "
+        "Return JSON only with keys: aggregate_id, status, confidence, rationale, checked_image. "
+        "Allowed status values: supports, uncertain, does_not_support. Confidence must be 0 to 1. "
+        f"aggregate_id={aggregate_id(aggregate)}; "
+        f"checked_image={review_image}; "
+        f"figure={aggregate.figure}; panels={aggregate.panel_a} vs {aggregate.panel_b}; "
+        f"row={aggregate.row_label or aggregate.row_index_a}; "
+        f"independent_local_matches={aggregate.match_count}; raw_pairwise_matches={aggregate.raw_match_count}; "
+        f"top_score={aggregate.top_score}; mean_top_score={aggregate.mean_top_score}; "
+        f"mean_context_score={aggregate.mean_context_score}; dominant_orientation={aggregate.dominant_orientation}; "
+        f"lane_offset_std={aggregate.lane_offset_std}; full_row_score={aggregate.full_row_score}."
+    )
+
+
+def aggregate_id(aggregate: EvidenceAggregate) -> str:
+    row = aggregate.row_label or f"row-{aggregate.row_index_a}"
+    return f"{aggregate.figure.replace(' ', '-')}_{aggregate.panel_a}_vs_{aggregate.panel_b}_{row}"
+
+
+def apply_multimodal_review_result(
     aggregate: EvidenceAggregate,
-    api_key: str,
-    model: str,
-    timeout: int,
+    result: dict,
+    source: str,
 ) -> None:
-    image_path = Path(aggregate.review_image)
-    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    prompt = (
-        "You are reviewing a Western blot image-duplication triage result. "
-        "The image shows two figure panels with colored boxes marking multiple local candidate matches in the same protein row, "
-        "and thumbnails of the local evidence. Assess whether the highlighted local patches visually support suspicious localized reuse. "
-        "Do not claim misconduct or whole-row identity. Return JSON only with keys: "
-        "status (supports, uncertain, does_not_support), confidence (0 to 1), rationale (brief). "
-        f"Candidate metadata: figure={aggregate.figure}, panels={aggregate.panel_a} vs {aggregate.panel_b}, "
-        f"row={aggregate.row_label or aggregate.row_index_a}, independent_local_matches={aggregate.match_count}, "
-        f"raw_pairwise_matches={aggregate.raw_match_count}, "
-        f"top_score={aggregate.top_score}, mean_top_score={aggregate.mean_top_score}, "
-        f"full_row_score={aggregate.full_row_score}."
-    )
-    payload = {
-        "model": model,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{image_b64}",
-                        "detail": "high",
-                    },
-                ],
-            }
-        ],
-        "max_output_tokens": 300,
-    }
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        aggregate.multimodal_status = "error"
-        aggregate.multimodal_model = model
-        aggregate.multimodal_error = f"HTTP {exc.code}: {detail[:500]}"
-        return
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        aggregate.multimodal_status = "error"
-        aggregate.multimodal_model = model
-        aggregate.multimodal_error = str(exc)
-        return
-
-    try:
-        parsed_response = json.loads(body)
-    except json.JSONDecodeError:
-        aggregate.multimodal_status = "error"
-        aggregate.multimodal_model = model
-        aggregate.multimodal_error = f"Non-JSON API response: {body[:500]}"
-        return
-
-    text = extract_response_text(parsed_response)
-    parsed = parse_json_object(text)
-    if parsed is None:
-        aggregate.multimodal_status = "uncertain"
-        aggregate.multimodal_model = model
-        aggregate.multimodal_rationale = text[:1000] if text else "No parseable model text."
-        return
-
-    status = str(parsed.get("status", "uncertain")).strip().lower()
+    status = str(result.get("status", "uncertain")).strip().lower()
     if status not in {"supports", "uncertain", "does_not_support"}:
         status = "uncertain"
-    confidence = parsed.get("confidence")
+    confidence = result.get("confidence")
     try:
         confidence_value = float(confidence)
     except (TypeError, ValueError):
@@ -2296,30 +2231,118 @@ def verify_aggregate_with_openai(
         confidence_value = max(0.0, min(1.0, confidence_value))
     aggregate.multimodal_status = status
     aggregate.multimodal_confidence = round(confidence_value, 3) if confidence_value is not None else None
-    aggregate.multimodal_rationale = str(parsed.get("rationale", "")).strip()[:1000]
-    aggregate.multimodal_model = model
+    aggregate.multimodal_rationale = str(result.get("rationale", "")).strip()[:1000]
+    aggregate.multimodal_model = str(result.get("model") or result.get("agent") or source).strip()[:120]
+    aggregate.multimodal_error = None
 
 
-def run_multimodal_verification(
+def write_multimodal_review_package(
+    output_dir: Path,
     aggregates: list[EvidenceAggregate],
-    mode: str,
-    model: str,
     max_aggregates: int,
-    timeout: int,
 ) -> None:
-    if mode == "off":
+    review_dir = output_dir / "multimodal"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    selected = aggregates[:max_aggregates] if max_aggregates > 0 else aggregates
+    tasks: list[dict] = []
+    md_lines = [
+        "# Multimodal Evidence Review Tasks",
+        "",
+        "Use a vision-capable agent or model to inspect each aggregate review image. Return JSON matching the schema below, then pass it back with `--multimodal-review-json` to merge the review into the report.",
+        "",
+        "```json",
+        '{"aggregate_id":"...","status":"supports|uncertain|does_not_support","confidence":0.0,"rationale":"brief visual rationale","checked_image":"relative/path.png","model":"optional model or agent name"}',
+        "```",
+        "",
+    ]
+    for aggregate in selected:
+        task = {
+            "aggregate_id": aggregate_id(aggregate),
+            "review_image": relative_to(aggregate.review_image, output_dir),
+            "prompt": multimodal_review_prompt(aggregate, output_dir),
+            "metadata": asdict(aggregate),
+        }
+        tasks.append(task)
+        md_lines.extend(
+            [
+                f"## {task['aggregate_id']}",
+                "",
+                f"Image: `{task['review_image']}`",
+                "",
+                task["prompt"],
+                "",
+                f"![aggregate review]({task['review_image']})",
+                "",
+            ]
+        )
+
+    package = {
+        "schema_version": 1,
+        "review_schema": {
+            "aggregate_id": "string",
+            "status": "supports | uncertain | does_not_support",
+            "confidence": "number from 0 to 1",
+            "rationale": "brief visual rationale",
+            "checked_image": "relative review image path",
+            "model": "optional model or agent name",
+        },
+        "tasks": tasks,
+    }
+    (review_dir / "multimodal_review.json").write_text(
+        json.dumps(package, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (review_dir / "multimodal_review.md").write_text("\n".join(md_lines), encoding="utf-8")
+
+
+def load_multimodal_review_results(path: Path) -> list[dict]:
+    text = path.read_text(encoding="utf-8")
+    parsed = parse_json_object(text)
+    if parsed is None:
+        loaded = json.loads(text)
+    else:
+        loaded = parsed
+    if isinstance(loaded, list):
+        return [item for item in loaded if isinstance(item, dict)]
+    if isinstance(loaded, dict):
+        if isinstance(loaded.get("reviews"), list):
+            return [item for item in loaded["reviews"] if isinstance(item, dict)]
+        if isinstance(loaded.get("results"), list):
+            return [item for item in loaded["results"] if isinstance(item, dict)]
+        return [loaded]
+    return []
+
+
+def apply_multimodal_review_result_items(
+    aggregates: list[EvidenceAggregate],
+    results: list[dict],
+    source: str,
+) -> None:
+    aggregates_by_id = {aggregate_id(aggregate): aggregate for aggregate in aggregates}
+    for result in results:
+        target_id = str(result.get("aggregate_id", "")).strip()
+        aggregate = aggregates_by_id.get(target_id)
+        if aggregate is None and len(aggregates) == 1:
+            aggregate = aggregates[0]
+        if aggregate is None:
+            continue
+        apply_multimodal_review_result(aggregate, result, source=source)
+
+
+def apply_multimodal_review_results(
+    aggregates: list[EvidenceAggregate],
+    review_json: Path | None,
+) -> None:
+    if review_json is None:
         return
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        if mode == "always":
-            log("Multimodal verification note: OPENAI_API_KEY is not set; verification was requested but cannot run.")
-        for aggregate in aggregates[:max_aggregates]:
-            aggregate.multimodal_status = "skipped"
-            aggregate.multimodal_model = model
-            aggregate.multimodal_error = "OPENAI_API_KEY is not set."
+    try:
+        results = load_multimodal_review_results(review_json)
+    except (OSError, json.JSONDecodeError) as exc:
+        for aggregate in aggregates:
+            aggregate.multimodal_status = "error"
+            aggregate.multimodal_error = f"Cannot load multimodal review JSON: {exc}"
         return
-    for aggregate in aggregates[:max_aggregates]:
-        verify_aggregate_with_openai(aggregate, api_key, model, timeout)
+    apply_multimodal_review_result_items(aggregates, results, source=str(review_json))
 
 
 def relative_to(path: str | Path, root: Path) -> str:
@@ -2344,7 +2367,7 @@ def write_report(
     matches: list[MatchCandidate],
     aggregates: list[EvidenceAggregate],
     comparison_stats: ComparisonStats,
-    settings: dict[str, float | int | str],
+    settings: dict[str, float | int | str | bool],
 ) -> None:
     ocr_label_count = sum(1 for panel in panels if panel.label_source == "ocr")
     text_filtered_strip_count = sum(panel.text_filtered_strip_count for panel in panels)
@@ -2363,6 +2386,18 @@ def write_report(
         encoding="utf-8",
     )
 
+    multimodal_package_note = (
+        f"- Multimodal review package: {relative_to(output_dir / 'multimodal' / 'multimodal_review.md', output_dir)}"
+        if settings.get("multimodal_package", True)
+        else "- Multimodal review package: disabled"
+    )
+    multimodal_html_note = (
+        "Portable multimodal review tasks are written to <code>multimodal/multimodal_review.md</code> "
+        "and can be reviewed by Codex, OpenClaw, or any vision-capable agent."
+        if settings.get("multimodal_package", True)
+        else "Portable multimodal review package generation was disabled for this run."
+    )
+
     md_lines = [
         "# Paper Image Duplication Audit",
         "",
@@ -2374,6 +2409,7 @@ def write_report(
         f"- Small WB/gel patch candidates filtered: {small_filtered_strip_count}",
         f"- Suspicious candidates: {len(matches)}",
         f"- Evidence aggregates: {len(aggregates)}",
+        multimodal_package_note,
         f"- Pairwise comparisons considered: {comparison_stats.pairs_considered}",
         f"- Pairs skipped for protein-row mismatch: {comparison_stats.pairs_skipped_row_mismatch}",
         f"- Pairs skipped for missing/partial protein-row labels: {comparison_stats.pairs_skipped_row_unknown}",
@@ -2406,7 +2442,7 @@ def write_report(
                 f"- Row coverage: {optional_float(aggregate.row_coverage_a)} vs {optional_float(aggregate.row_coverage_b)}",
                 f"- Lane-offset consistent: {aggregate.lane_offset_consistent} (std {optional_float(aggregate.lane_offset_std)})",
                 f"- Support matches: {', '.join(aggregate.support_matches)}",
-                f"- Multimodal verification: {multimodal_line}",
+                f"- Multimodal review: {multimodal_line}",
                 f"- Multimodal rationale: {aggregate.multimodal_rationale or aggregate.multimodal_error or 'n/a'}",
                 f"- Note: {aggregate.note}",
                 "",
@@ -2416,8 +2452,8 @@ def write_report(
         )
     md_lines.extend(
         [
-        "## Suspicious Candidates",
-        "",
+            "## Suspicious Candidates",
+            "",
         ]
     )
     if not matches:
@@ -2533,7 +2569,7 @@ def write_report(
     <div class="metric"><b>{comparison_stats.pairs_skipped_size_mismatch}</b>Size-mismatch pairs skipped</div>
   </div>
   <h2>Evidence Aggregates</h2>
-  <p class="note">Aggregates group multiple local same-row matches into row-level support. A low full-row score can still be compatible with localized band reuse; it means the entire row is not pixel-identical.</p>
+  <p class="note">Aggregates group multiple local same-row matches into row-level support. A low full-row score can still be compatible with localized band reuse; it means the entire row is not pixel-identical. {multimodal_html_note}</p>
   <table>
     <thead>
       <tr><th>Level</th><th>Panels</th><th>Page</th><th>Protein Row</th><th>Support</th><th>Scores</th><th>Context</th><th>Orientation</th><th>Full Row</th><th>Coverage</th><th>Multimodal</th><th>Review</th></tr>
@@ -2631,27 +2667,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Minimum fraction of independent aggregate matches sharing the same orientation",
     )
     parser.add_argument(
-        "--multimodal-verify",
-        choices=("off", "auto", "always"),
-        default="off",
-        help="Use an OpenAI multimodal model to verify aggregate evidence images; auto/always require OPENAI_API_KEY",
+        "--multimodal-package",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write portable multimodal review tasks for any vision-capable agent or model",
     )
     parser.add_argument(
-        "--multimodal-model",
-        default="gpt-5.5",
-        help="OpenAI multimodal model used when --multimodal-verify is auto or always",
+        "--multimodal-review-json",
+        type=Path,
+        help="JSON review results from Codex, OpenClaw, or another vision-capable agent to merge into the report",
     )
     parser.add_argument(
         "--multimodal-max-aggregates",
         type=int,
         default=5,
-        help="Maximum aggregate evidence images sent for multimodal verification",
-    )
-    parser.add_argument(
-        "--multimodal-timeout",
-        type=int,
-        default=60,
-        help="Timeout in seconds for each multimodal verification request",
+        help="Maximum aggregate evidence images included in the portable multimodal review package; 0 includes all",
     )
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing rendered pages/layout when present")
     parser.add_argument(
@@ -2669,6 +2699,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.out.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     check_ocr_dependencies()
+
+    multimodal_review_source = ""
+    multimodal_review_results: list[dict] | None = None
+    multimodal_review_error: str | None = None
+    if args.multimodal_review_json is not None:
+        review_json_path = args.multimodal_review_json.expanduser().resolve()
+        multimodal_review_source = str(review_json_path)
+        try:
+            multimodal_review_results = load_multimodal_review_results(review_json_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            multimodal_review_error = f"Cannot load multimodal review JSON: {exc}"
 
     layout_path = output_dir / "layout.json"
     if args.keep_existing and layout_path.exists():
@@ -2729,15 +2770,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_aggregate_context_score=args.min_aggregate_context_score,
         min_aggregate_orientation_fraction=args.min_aggregate_orientation_fraction,
     )
-    if args.multimodal_verify != "off":
-        log("Running multimodal aggregate verification...")
-        run_multimodal_verification(
+    if args.multimodal_package:
+        log("Writing multimodal review package...")
+        write_multimodal_review_package(
+            output_dir,
             aggregates,
-            args.multimodal_verify,
-            args.multimodal_model,
             max(0, args.multimodal_max_aggregates),
-            args.multimodal_timeout,
         )
+    if args.multimodal_review_json is not None:
+        log("Applying multimodal review results...")
+        if multimodal_review_error is not None:
+            for aggregate in aggregates:
+                aggregate.multimodal_status = "error"
+                aggregate.multimodal_error = multimodal_review_error
+        else:
+            apply_multimodal_review_result_items(
+                aggregates,
+                multimodal_review_results or [],
+                source=multimodal_review_source,
+            )
     log("Writing report...")
     write_report(
         output_dir,
@@ -2761,8 +2812,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "aggregate_top_k": args.aggregate_top_k,
             "min_aggregate_context_score": args.min_aggregate_context_score,
             "min_aggregate_orientation_fraction": args.min_aggregate_orientation_fraction,
-            "multimodal_verify": args.multimodal_verify,
-            "multimodal_model": args.multimodal_model,
+            "multimodal_package": args.multimodal_package,
+            "multimodal_review_json": multimodal_review_source,
             "multimodal_max_aggregates": args.multimodal_max_aggregates,
             "pdf_backend": args.pdf_backend,
         },

@@ -25,9 +25,9 @@ When reviewing a candidate:
 
 ## Multimodal Verification
 
-Use multimodal verification only as a second-stage reviewer of aggregate evidence images. It can help check whether highlighted boxes visually sit on comparable blot bands and whether the aggregate image supports localized reuse, but it must not replace numerical scoring, OCR/protein-row checks, or human review of the manuscript context.
+Use multimodal verification only as a second-stage reviewer of aggregate evidence images. It can help check whether highlighted boxes visually sit on comparable blot bands and whether the aggregate image supports localized reuse, but it must not replace numerical scoring, OCR/protein-row checks, or human review of the manuscript context. The review can be performed by Codex, OpenClaw, or any other agent/tool that can call a vision-capable model; the audit script only needs to provide the evidence image, metadata, prompt, and result schema.
 
-Keep multimodal verification disabled for confidential manuscripts unless external API review is approved. When enabled, record the model status, confidence, and rationale from the report; treat `uncertain`, API errors, or missing API keys as non-confirmatory rather than negative evidence.
+Keep multimodal verification local to the current agent/session for confidential manuscripts unless sending images to an external or hosted model is approved. When a review is available, record the model or agent name, status, confidence, and rationale in the report; treat `uncertain`, tool errors, or missing review results as non-confirmatory rather than negative evidence.
 
 ## Common False Positives
 
