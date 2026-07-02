@@ -1,9 +1,9 @@
 ---
-name: paper-image-duplication-audit
+name: paper-image-audit-skill
 description: Audit scientific paper PDFs or figure images for common PubPeer-style image-integrity concerns, including duplicated, transformed, reused, spliced, cloned, selectively enhanced, or relabeled images. Use when Codex needs to inspect manuscript figures, split figures into subpanels, detect Western blot/gel band reuse, screen non-WB panels for whole-panel reuse or transforms, triage microscopy/TEM/photo/flow/chart concerns, and produce a human-reviewable report with highlighted candidate regions and cautious evidence wording.
 ---
 
-# Paper Image Duplication Audit
+# Paper Image Audit
 
 ## Overview
 

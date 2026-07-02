@@ -7,7 +7,7 @@ Usage:
   scripts/install_dependencies.sh --check
   scripts/install_dependencies.sh --install
 
-Checks or installs dependencies for paper-image-duplication-audit on macOS and Linux:
+Checks or installs dependencies for paper-image-audit-skill on macOS and Linux:
   - Python packages: pymupdf, pillow, numpy
   - Tesseract OCR
   - Tesseract English and Chinese language data: eng, chi_sim, chi_tra

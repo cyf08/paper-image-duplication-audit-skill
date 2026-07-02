@@ -1,13 +1,13 @@
-# Paper Image Duplication Audit Skill
+# Paper Image Audit Skill
 
-This repository packages the `paper-image-duplication-audit` Codex skill.
+This repository packages the `paper-image-audit-skill` Codex skill.
 
 ## Install
 
 Copy the skill folder into a Codex skill root:
 
 ```bash
-cp -R paper-image-duplication-audit ~/.codex/skills/
+cp -R paper-image-audit-skill ~/.codex/skills/
 ```
 
 Then check dependencies.
@@ -15,13 +15,13 @@ Then check dependencies.
 macOS/Linux:
 
 ```bash
-~/.codex/skills/paper-image-duplication-audit/scripts/install_dependencies.sh --check
+~/.codex/skills/paper-image-audit-skill/scripts/install_dependencies.sh --check
 ```
 
 Windows PowerShell:
 
 ```powershell
-~\.codex\skills\paper-image-duplication-audit\scripts\install_dependencies.ps1 --check
+~\.codex\skills\paper-image-audit-skill\scripts\install_dependencies.ps1 --check
 ```
 
 Install dependencies when needed.
@@ -29,13 +29,13 @@ Install dependencies when needed.
 macOS/Linux:
 
 ```bash
-~/.codex/skills/paper-image-duplication-audit/scripts/install_dependencies.sh --install
+~/.codex/skills/paper-image-audit-skill/scripts/install_dependencies.sh --install
 ```
 
 Windows PowerShell:
 
 ```powershell
-~\.codex\skills\paper-image-duplication-audit\scripts\install_dependencies.ps1 --install
+~\.codex\skills\paper-image-audit-skill\scripts\install_dependencies.ps1 --install
 ```
 
 ## Platform Support
@@ -49,7 +49,7 @@ Windows PowerShell:
 The audit script filters tiny WB/gel patch candidates by default because very small dark blobs can become artificially similar after resizing. Routine audits use:
 
 ```bash
-python3 paper-image-duplication-audit/scripts/audit_paper_images.py manuscript.pdf \
+python3 paper-image-audit-skill/scripts/audit_paper_images.py manuscript.pdf \
   --out audit-output \
   --min-patch-area 450 \
   --min-patch-width 18 \
@@ -65,8 +65,8 @@ The same skill is also available as a tarball under `dist/`.
 
 ## Contents
 
-- `paper-image-duplication-audit/SKILL.md`
-- `paper-image-duplication-audit/agents/openai.yaml`
-- `paper-image-duplication-audit/references/review-rules.md`
-- `paper-image-duplication-audit/scripts/`
-- `paper-image-duplication-audit/requirements.txt`
+- `paper-image-audit-skill/SKILL.md`
+- `paper-image-audit-skill/agents/openai.yaml`
+- `paper-image-audit-skill/references/review-rules.md`
+- `paper-image-audit-skill/scripts/`
+- `paper-image-audit-skill/requirements.txt`

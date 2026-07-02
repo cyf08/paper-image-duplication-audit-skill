@@ -2626,7 +2626,7 @@ def write_report(
     )
 
     md_lines = [
-        "# Paper Image Duplication Audit",
+        "# Paper Image Audit",
         "",
         f"- Figures processed: {len(figures)}",
         f"- Panels detected: {len(panels)}",
@@ -2845,7 +2845,7 @@ def write_report(
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Paper Image Duplication Audit</title>
+  <title>Paper Image Audit</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 28px; color: #1f2933; }}
     h1 {{ font-size: 28px; margin-bottom: 8px; }}
@@ -2861,7 +2861,7 @@ def write_report(
   </style>
 </head>
 <body>
-  <h1>Paper Image Duplication Audit</h1>
+  <h1>Paper Image Audit</h1>
   <p class="note">Candidates are computational triage results for manual review, not final conclusions.</p>
   <p class="note"><a href="manual_review_checklist.md">Manual image-integrity checklist</a></p>
   <div class="summary">

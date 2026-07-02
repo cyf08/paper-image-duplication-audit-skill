@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Image Audit"
+  short_description: "Audit paper image-integrity concerns."
+  default_prompt: "Use $paper-image-audit-skill to audit this paper PDF or figure image for duplicated, transformed, spliced, cloned, or relabeled figure content and produce a reviewable report with cautious evidence wording."
