@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Audit scientific paper figures for suspicious image reuse.
+"""Audit scientific paper PDFs or figure images for suspicious image reuse.
 
 This script uses Python, Pillow, NumPy, PyMuPDF, and Tesseract OCR. PyMuPDF is
-the cross-platform PDF backend for Windows, macOS, and Linux; the bundled Swift
-PDFKit helpers remain as a macOS fallback. This is a first-pass triage tool:
-report candidates for human review rather than definitive misconduct.
+the cross-platform PDF backend for Windows, macOS, and Linux; direct image input
+skips the PDF backend. This is a first-pass triage tool: report candidates for
+human review rather than definitive misconduct.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PANEL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+PDF_SUFFIXES = {".pdf"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+DERIVED_OUTPUT_DIRS = ("figures", "panels", "strips", "matches", "aggregates", "ocr")
 
 
 @dataclass
@@ -154,6 +157,24 @@ class EvidenceAggregate:
 
 
 @dataclass
+class PanelMatchCandidate:
+    figure_a: str
+    page_a: int
+    panel_a: str
+    figure_b: str
+    page_b: int
+    panel_b: str
+    category_a: str
+    category_b: str
+    score: float
+    orientation: str
+    level: str
+    area_ratio: float
+    review_image: str
+    note: str
+
+
+@dataclass
 class OcrWord:
     text: str
     confidence: float
@@ -176,6 +197,11 @@ class ComparisonStats:
     pairs_skipped_size_mismatch: int = 0
     pairs_skipped_context: int = 0
     pairs_below_score: int = 0
+    panel_pairs_considered: int = 0
+    panel_pairs_skipped_blot: int = 0
+    panel_pairs_skipped_scope: int = 0
+    panel_pairs_skipped_area_ratio: int = 0
+    panel_pairs_below_score: int = 0
 
 
 def log(message: str) -> None:
@@ -363,8 +389,8 @@ def preferred_ocr_language(langs: set[str]) -> str:
     return "+".join(selected) if selected else "eng"
 
 
-def check_ocr_dependencies() -> None:
-    if load_pymupdf() is None:
+def check_ocr_dependencies(require_pdf: bool = True) -> None:
+    if require_pdf and load_pymupdf() is None:
         log("PDF dependency note: PyMuPDF not found. Install with: python -m pip install pymupdf")
 
     tesseract = find_tesseract()
@@ -619,6 +645,47 @@ def save_figures(
                 figure_number=fig["figure_number"],
                 page=fig["page"],
                 bbox=(x0, final_y0, x1, final_y1),
+                image_path=str(out_path),
+            )
+        )
+    return saved
+
+
+def safe_stem(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip("-")
+    return stem or "image"
+
+
+def save_input_images(image_paths: Sequence[Path], figures_dir: Path, target_figure: int | None) -> list[FigureCandidate]:
+    saved: list[FigureCandidate] = []
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    for index, image_path in enumerate(image_paths, start=1):
+        if target_figure is not None and index != target_figure:
+            continue
+        image = Image.open(image_path).convert("RGB")
+        bbox = content_bbox(image)
+        if bbox is not None:
+            x0, y0, x1, y1 = bbox
+            pad = 8
+            crop_box = (
+                max(0, x0 - pad),
+                max(0, y0 - pad),
+                min(image.width, x1 + pad),
+                min(image.height, y1 + pad),
+            )
+            crop = image.crop(crop_box)
+            figure_bbox = crop_box
+        else:
+            crop = image
+            figure_bbox = (0, 0, image.width, image.height)
+        out_path = figures_dir / f"figure-{index}_image-{safe_stem(image_path)}.png"
+        crop.save(out_path)
+        saved.append(
+            FigureCandidate(
+                figure=f"Figure {index}",
+                figure_number=index,
+                page=index,
+                bbox=figure_bbox,
                 image_path=str(out_path),
             )
         )
@@ -1578,6 +1645,75 @@ def strip_similarity(path_a: str, path_b: str) -> tuple[float, str]:
     return best_score, best_orientation
 
 
+def apply_panel_transform(image: Image.Image, transform: str) -> Image.Image:
+    if transform == "h":
+        return ImageOps.mirror(image)
+    if transform == "v":
+        return ImageOps.flip(image)
+    if transform == "rot180":
+        return image.rotate(180, expand=True)
+    if transform == "rot90":
+        return image.rotate(90, expand=True)
+    if transform == "rot270":
+        return image.rotate(270, expand=True)
+    return image
+
+
+def normalized_panel(path: str, transform: str = "none", size: tuple[int, int] = (180, 180)) -> np.ndarray:
+    image = Image.open(path).convert("L")
+    bbox = content_bbox(image, threshold=248)
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        image = image.crop((x0, y0, x1, y1))
+    image = apply_panel_transform(image, transform)
+    image = ImageOps.autocontrast(image, cutoff=1)
+    image = image.resize(size, Image.Resampling.BICUBIC)
+    arr = np.array(image).astype(float)
+    arr = arr - arr.mean()
+    std = arr.std()
+    if std < 1e-6:
+        return arr
+    return arr / std
+
+
+def panel_similarity(path_a: str, path_b: str) -> tuple[float, str]:
+    base_a = normalized_panel(path_a)
+    best_score = -1.0
+    best_orientation = "none"
+    for orientation in ("none", "h", "v", "rot180", "rot90", "rot270"):
+        panel_b = normalized_panel(path_b, transform=orientation)
+        score = ncc(base_a, panel_b)
+        if score > best_score:
+            best_score = score
+            best_orientation = orientation
+    return best_score, best_orientation
+
+
+def draw_panel_review_image(
+    panel_a: PanelCandidate,
+    panel_b: PanelCandidate,
+    output_path: Path,
+    orientation: str,
+) -> None:
+    img_a = Image.open(panel_a.image_path).convert("RGB")
+    img_b = apply_panel_transform(Image.open(panel_b.image_path).convert("RGB"), orientation)
+    max_h = max(img_a.height, img_b.height)
+    canvas_w = img_a.width + img_b.width + 30
+    canvas_h = max_h + 48
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
+    canvas.paste(img_a, (0, 38))
+    canvas.paste(img_b, (img_a.width + 30, 38))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((0, 8), f"{panel_a.figure}{panel_a.label} page {panel_a.page}", fill=(0, 0, 0))
+    draw.text(
+        (img_a.width + 30, 8),
+        f"{panel_b.figure}{panel_b.label} page {panel_b.page} / {orientation}",
+        fill=(0, 0, 0),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
 def context_similarity(
     panel_a: PanelCandidate,
     panel_b: PanelCandidate,
@@ -2345,8 +2481,97 @@ def apply_multimodal_review_results(
     apply_multimodal_review_result_items(aggregates, results, source=str(review_json))
 
 
+def compare_other_panels(
+    panels: list[PanelCandidate],
+    matches_dir: Path,
+    min_score: float,
+    top_n: int,
+    min_area_ratio: float,
+    scope: str,
+    stats: ComparisonStats,
+) -> list[PanelMatchCandidate]:
+    candidates: list[tuple[PanelMatchCandidate, PanelCandidate, PanelCandidate]] = []
+    for i, panel_a in enumerate(panels):
+        for panel_b in panels[i + 1 :]:
+            stats.panel_pairs_considered += 1
+            if scope == "same-figure" and (panel_a.figure, panel_a.page) != (panel_b.figure, panel_b.page):
+                stats.panel_pairs_skipped_scope += 1
+                continue
+            if panel_a.category == "blot" or panel_b.category == "blot":
+                stats.panel_pairs_skipped_blot += 1
+                continue
+            area_ratio = box_area_ratio(panel_a.bbox, panel_b.bbox)
+            if area_ratio < min_area_ratio:
+                stats.panel_pairs_skipped_area_ratio += 1
+                continue
+            score, orientation = panel_similarity(panel_a.image_path, panel_b.image_path)
+            if score < min_score:
+                stats.panel_pairs_below_score += 1
+                continue
+            review_name = (
+                f"whole-panel_{panel_a.figure.lower().replace(' ', '-')}-{panel_a.label}_"
+                f"vs_{panel_b.figure.lower().replace(' ', '-')}-{panel_b.label}_{score:.3f}.png"
+            )
+            review_path = matches_dir / review_name
+            note = (
+                "Whole-panel non-WB/gel similarity candidate after contrast normalization and transform search. "
+                "Useful for microscopy, TEM, colony, gross-photo, or other raster-panel reuse triage; not a local clone or splice claim."
+            )
+            match = PanelMatchCandidate(
+                figure_a=panel_a.figure,
+                page_a=panel_a.page,
+                panel_a=panel_a.label,
+                figure_b=panel_b.figure,
+                page_b=panel_b.page,
+                panel_b=panel_b.label,
+                category_a=panel_a.category,
+                category_b=panel_b.category,
+                score=round(score, 4),
+                orientation=orientation,
+                level=candidate_level(score),
+                area_ratio=round(area_ratio, 4),
+                review_image=str(review_path),
+                note=note,
+            )
+            candidates.append((match, panel_a, panel_b))
+
+    candidates.sort(key=lambda c: c[0].score, reverse=True)
+    top_candidates = candidates[:top_n]
+    for match, panel_a, panel_b in top_candidates:
+        draw_panel_review_image(panel_a, panel_b, Path(match.review_image), match.orientation)
+    return [match for match, _, _ in top_candidates]
+
+
 def relative_to(path: str | Path, root: Path) -> str:
     return os.path.relpath(str(path), str(root))
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def guard_inputs_outside_reset_dirs(input_paths: Sequence[Path], output_dir: Path) -> None:
+    reset_roots = [(output_dir / name).resolve() for name in DERIVED_OUTPUT_DIRS]
+    unsafe_inputs: list[tuple[Path, Path]] = []
+    for input_path in input_paths:
+        resolved_input = input_path.resolve()
+        for reset_root in reset_roots:
+            if path_is_within(resolved_input, reset_root):
+                unsafe_inputs.append((resolved_input, reset_root))
+                break
+
+    if not unsafe_inputs:
+        return
+
+    details = "; ".join(f"{input_path} is under {reset_root}" for input_path, reset_root in unsafe_inputs)
+    raise ValueError(
+        "Refusing to read input file(s) from output subdirectories that this run clears: "
+        f"{details}. Move or copy the input outside the output directory, or choose a different --out path."
+    )
 
 
 def reset_dir(path: Path) -> None:
@@ -2366,6 +2591,7 @@ def write_report(
     strips: list[StripCandidate],
     matches: list[MatchCandidate],
     aggregates: list[EvidenceAggregate],
+    panel_matches: list[PanelMatchCandidate],
     comparison_stats: ComparisonStats,
     settings: dict[str, float | int | str | bool],
 ) -> None:
@@ -2380,6 +2606,7 @@ def write_report(
         "strips": [asdict(s) for s in strips],
         "matches": [asdict(m) for m in matches],
         "evidence_aggregates": [asdict(a) for a in aggregates],
+        "panel_matches": [asdict(m) for m in panel_matches],
     }
     (output_dir / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2),
@@ -2407,7 +2634,8 @@ def write_report(
         f"- WB/gel strips extracted: {len(strips)}",
         f"- OCR text-filtered strip candidates: {text_filtered_strip_count}",
         f"- Small WB/gel patch candidates filtered: {small_filtered_strip_count}",
-        f"- Suspicious candidates: {len(matches)}",
+        f"- Suspicious WB/gel candidates: {len(matches)}",
+        f"- Suspicious whole-panel candidates: {len(panel_matches)}",
         f"- Evidence aggregates: {len(aggregates)}",
         multimodal_package_note,
         f"- Pairwise comparisons considered: {comparison_stats.pairs_considered}",
@@ -2416,6 +2644,8 @@ def write_report(
         f"- Pairs skipped for small evidence patches: {comparison_stats.pairs_skipped_small}",
         f"- Pairs skipped for size mismatch: {comparison_stats.pairs_skipped_size_mismatch}",
         f"- Pairs skipped for context threshold: {comparison_stats.pairs_skipped_context}",
+        f"- Whole-panel comparisons considered: {comparison_stats.panel_pairs_considered}",
+        "- Manual review checklist: manual_review_checklist.md",
         "",
         "## Evidence Aggregates",
         "",
@@ -2452,7 +2682,7 @@ def write_report(
         )
     md_lines.extend(
         [
-            "## Suspicious Candidates",
+            "## Suspicious WB/Gel Candidates",
             "",
         ]
     )
@@ -2470,6 +2700,26 @@ def write_report(
                 f"- Score: {match.score:.4f}",
                 f"- Context score: {match.context_score:.4f}",
                 f"- Evidence area: {match.evidence_area_a} px vs {match.evidence_area_b} px",
+                f"- Area ratio: {match.area_ratio:.4f}",
+                f"- Orientation: {match.orientation}",
+                f"- Note: {match.note}",
+                "",
+                f"![review]({rel_review})",
+                "",
+            ]
+        )
+    md_lines.extend(["", "## Suspicious Whole-Panel Candidates", ""])
+    if not panel_matches:
+        md_lines.append("No whole-panel candidates passed the configured threshold.")
+    for match in panel_matches:
+        rel_review = relative_to(match.review_image, output_dir)
+        md_lines.extend(
+            [
+                f"### {match.level.upper()} {match.figure_a}{match.panel_a} vs {match.figure_b}{match.panel_b}",
+                "",
+                f"- Pages: {match.page_a} vs {match.page_b}",
+                f"- Categories: {match.category_a} vs {match.category_b}",
+                f"- Score: {match.score:.4f}",
                 f"- Area ratio: {match.area_ratio:.4f}",
                 f"- Orientation: {match.orientation}",
                 f"- Note: {match.note}",
@@ -2512,6 +2762,44 @@ def write_report(
         else "<tr><td colspan=\"12\">No aggregate evidence clusters met the configured threshold.</td></tr>"
     )
 
+    checklist_lines = [
+        "# Manual Image-Integrity Checklist",
+        "",
+        "Use this checklist after reviewing the automated candidates. The script output is triage evidence, not a misconduct conclusion.",
+        "",
+        "## Prioritize",
+        "",
+        f"- Review {len(matches)} WB/gel local candidate(s) in `report.html` and `matches/`.",
+        f"- Review {len(panel_matches)} non-WB whole-panel candidate(s) in `report.html` and `matches/`.",
+        "- Open `ocr/*_overlay.png` when panel labels, row labels, or text filtering look uncertain.",
+        "- Open original cropped figures in `figures/` and panel crops in `panels/` before writing any finding.",
+        "",
+        "## Check For",
+        "",
+        "- Whole-image duplication: same panel reused under different labels or conditions.",
+        "- Transformed reuse: mirror, vertical flip, rotation, scaling, cropping, contrast, or color conversion.",
+        "- Local cloning or patching: repeated cell clusters, tissue islands, organelles, colonies, scratches, bubbles, dust, or background texture.",
+        "- Undeclared splicing: lane joins, abrupt background steps, mismatched gel/blot exposure, missing boundary markers, or composite figure parts.",
+        "- Selective enhancement or concealment: local erasure, smoothing, painted background, over-contrast, or inconsistent noise.",
+        "- Relabeling: reused image content representing a different sample, antibody, time point, genotype, treatment, or disease model.",
+        "- Flow/plot reuse: identical dot clouds, histogram traces, gates, spectra, scatter points, or line traces with changed labels.",
+        "",
+        "## False-Positive Review",
+        "",
+        "- Check captions and methods for disclosed shared controls, representative images, reused reference panels, or composite boundaries.",
+        "- Ignore repeated labels, axes, legends, scale bars, molecular-weight markers, and layout templates unless the underlying image content also repeats.",
+        "- Treat tiny blobs, blank background, compression artifacts, and very simple bands as low confidence.",
+        "- For adjacent tissue or microscopy fields, require repeated biological structure plus repeated background/noise before reporting local cloning.",
+        "",
+        "## Reporting",
+        "",
+        "- Name the anomaly type and use cautious wording such as `suspicious reuse candidate` or `requires manual review`.",
+        "- Cite figure, panel, page, condition/sample context, score if available, transform if available, and evidence image path.",
+        "- Keep image-integrity observations separate from any statistical or numerical data concerns.",
+        "- Do not infer intent; request raw images/source data when the visible evidence is material.",
+    ]
+    (output_dir / "manual_review_checklist.md").write_text("\n".join(checklist_lines), encoding="utf-8")
+
     rows = []
     for match in matches:
         rel_review = html.escape(relative_to(match.review_image, output_dir))
@@ -2532,6 +2820,27 @@ def write_report(
             "</tr>"
         )
     table_body = "\n".join(rows) if rows else "<tr><td colspan=\"10\">No candidates passed the threshold.</td></tr>"
+    panel_rows = []
+    for match in panel_matches:
+        rel_review = html.escape(relative_to(match.review_image, output_dir))
+        panel_rows.append(
+            "<tr>"
+            f"<td>{html.escape(match.level)}</td>"
+            f"<td>{html.escape(match.figure_a)}{html.escape(match.panel_a)} vs "
+            f"{html.escape(match.figure_b)}{html.escape(match.panel_b)}</td>"
+            f"<td>{match.page_a} / {match.page_b}</td>"
+            f"<td>{html.escape(match.category_a)} / {html.escape(match.category_b)}</td>"
+            f"<td>{match.score:.4f}</td>"
+            f"<td>{match.area_ratio:.3f}</td>"
+            f"<td>{html.escape(match.orientation)}</td>"
+            f"<td><img src=\"{rel_review}\" /></td>"
+            "</tr>"
+        )
+    panel_table_body = (
+        "\n".join(panel_rows)
+        if panel_rows
+        else "<tr><td colspan=\"8\">No whole-panel candidates passed the threshold.</td></tr>"
+    )
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2554,6 +2863,7 @@ def write_report(
 <body>
   <h1>Paper Image Duplication Audit</h1>
   <p class="note">Candidates are computational triage results for manual review, not final conclusions.</p>
+  <p class="note"><a href="manual_review_checklist.md">Manual image-integrity checklist</a></p>
   <div class="summary">
     <div class="metric"><b>{len(figures)}</b>Figures processed</div>
     <div class="metric"><b>{len(panels)}</b>Panels detected</div>
@@ -2561,7 +2871,8 @@ def write_report(
     <div class="metric"><b>{len(strips)}</b>WB/gel strips</div>
     <div class="metric"><b>{text_filtered_strip_count}</b>OCR text-filtered strips</div>
     <div class="metric"><b>{small_filtered_strip_count}</b>Small patches filtered</div>
-    <div class="metric"><b>{len(matches)}</b>Suspicious candidates</div>
+    <div class="metric"><b>{len(matches)}</b>WB/gel candidates</div>
+    <div class="metric"><b>{len(panel_matches)}</b>Whole-panel candidates</div>
     <div class="metric"><b>{len(aggregates)}</b>Evidence aggregates</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_row_mismatch}</b>Protein-row mismatches skipped</div>
     <div class="metric"><b>{comparison_stats.pairs_skipped_row_unknown}</b>Unknown-row pairs skipped</div>
@@ -2578,13 +2889,22 @@ def write_report(
       {aggregate_body}
     </tbody>
   </table>
-  <h2>Suspicious Candidates</h2>
+  <h2>Suspicious WB/Gel Candidates</h2>
   <table>
     <thead>
       <tr><th>Level</th><th>Panels</th><th>Page</th><th>Strips</th><th>Protein Row</th><th>Score</th><th>Context</th><th>Evidence Area</th><th>Orientation</th><th>Review</th></tr>
     </thead>
     <tbody>
       {table_body}
+    </tbody>
+  </table>
+  <h2>Suspicious Whole-Panel Candidates</h2>
+  <table>
+    <thead>
+      <tr><th>Level</th><th>Panels</th><th>Pages</th><th>Categories</th><th>Score</th><th>Area Ratio</th><th>Orientation</th><th>Review</th></tr>
+    </thead>
+    <tbody>
+      {panel_table_body}
     </tbody>
   </table>
 </body>
@@ -2595,7 +2915,7 @@ def write_report(
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("pdf", type=Path, help="Input manuscript PDF")
+    parser.add_argument("inputs", nargs="+", type=Path, help="Input manuscript PDF or one or more figure image files")
     parser.add_argument("--out", type=Path, required=True, help="Output audit directory")
     parser.add_argument("--dpi", type=int, default=180, help="Render DPI")
     parser.add_argument("--figure", type=int, help="Limit audit to a single figure number")
@@ -2683,6 +3003,35 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=5,
         help="Maximum aggregate evidence images included in the portable multimodal review package; 0 includes all",
     )
+    parser.add_argument(
+        "--compare-other-panels",
+        action="store_true",
+        help="Also compare non-WB/gel panels for whole-panel reuse, mirror, flip, and rotation candidates",
+    )
+    parser.add_argument(
+        "--min-panel-score",
+        type=float,
+        default=0.92,
+        help="Minimum whole-panel similarity to report when --compare-other-panels is enabled",
+    )
+    parser.add_argument(
+        "--min-panel-area-ratio",
+        type=float,
+        default=0.65,
+        help="Minimum smaller/larger panel area ratio for whole-panel comparison",
+    )
+    parser.add_argument(
+        "--panel-scope",
+        choices=("same-figure", "all-figures"),
+        default="same-figure",
+        help="Scope for non-WB/gel whole-panel comparisons",
+    )
+    parser.add_argument(
+        "--top-panel-n",
+        type=int,
+        default=30,
+        help="Maximum whole-panel candidate matches to report",
+    )
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing rendered pages/layout when present")
     parser.add_argument(
         "--pdf-backend",
@@ -2693,12 +3042,32 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def detect_input_kind(input_paths: Sequence[Path]) -> str:
+    suffixes = [path.suffix.lower() for path in input_paths]
+    if len(input_paths) == 1 and suffixes[0] in PDF_SUFFIXES:
+        return "pdf"
+    if all(suffix in IMAGE_SUFFIXES for suffix in suffixes):
+        return "images"
+    supported = ", ".join(sorted(PDF_SUFFIXES | IMAGE_SUFFIXES))
+    raise ValueError(
+        "Input must be either one PDF or one or more image files. "
+        f"Supported extensions: {supported}"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    pdf_path = args.pdf.expanduser().resolve()
+    input_paths = [path.expanduser().resolve() for path in args.inputs]
+    missing = [str(path) for path in input_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Input file(s) not found: " + ", ".join(missing))
+    input_kind = detect_input_kind(input_paths)
     output_dir = args.out.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    check_ocr_dependencies()
+    check_ocr_dependencies(require_pdf=input_kind == "pdf")
+    guard_inputs_outside_reset_dirs(input_paths, output_dir)
+    for derived_dir in DERIVED_OUTPUT_DIRS:
+        reset_dir(output_dir / derived_dir)
 
     multimodal_review_source = ""
     multimodal_review_results: list[dict] | None = None
@@ -2711,29 +3080,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError) as exc:
             multimodal_review_error = f"Cannot load multimodal review JSON: {exc}"
 
-    layout_path = output_dir / "layout.json"
-    if args.keep_existing and layout_path.exists():
-        layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    if input_kind == "pdf":
+        pdf_path = input_paths[0]
+        layout_path = output_dir / "layout.json"
+        if args.keep_existing and layout_path.exists():
+            layout = json.loads(layout_path.read_text(encoding="utf-8"))
+        else:
+            log("Extracting PDF text/layout...")
+            layout = extract_layout(pdf_path, layout_path, args.pdf_backend)
+
+        figure_specs = discover_figures(layout, args.dpi, args.figure)
+        if not figure_specs:
+            raise RuntimeError("No matching figure pages were found in the PDF text layer.")
+
+        page_numbers = sorted({spec["page"] for spec in figure_specs})
+        page_spec = ",".join(str(page) for page in page_numbers)
+        pages_dir = output_dir / "pages"
+        if not args.keep_existing or not all((pages_dir / f"page-{page:03d}.png").exists() for page in page_numbers):
+            log(f"Rendering page(s): {page_spec}")
+            render_pages(pdf_path, pages_dir, args.dpi, page_spec, args.pdf_backend)
+
+        log("Cropping figure regions...")
+        figures = save_figures(figure_specs, pages_dir, output_dir / "figures", args.dpi)
     else:
-        log("Extracting PDF text/layout...")
-        layout = extract_layout(pdf_path, layout_path, args.pdf_backend)
+        log("Preparing input figure image(s)...")
+        figures = save_input_images(input_paths, output_dir / "figures", args.figure)
+        if not figures:
+            raise RuntimeError("No matching input image was selected. Check --figure index.")
 
-    figure_specs = discover_figures(layout, args.dpi, args.figure)
-    if not figure_specs:
-        raise RuntimeError("No matching figure pages were found in the PDF text layer.")
-
-    page_numbers = sorted({spec["page"] for spec in figure_specs})
-    page_spec = ",".join(str(page) for page in page_numbers)
-    pages_dir = output_dir / "pages"
-    if not args.keep_existing or not all((pages_dir / f"page-{page:03d}.png").exists() for page in page_numbers):
-        log(f"Rendering page(s): {page_spec}")
-        render_pages(pdf_path, pages_dir, args.dpi, page_spec, args.pdf_backend)
-
-    for derived_dir in ("figures", "panels", "strips", "matches", "aggregates", "ocr"):
-        reset_dir(output_dir / derived_dir)
-
-    log("Cropping figure regions...")
-    figures = save_figures(figure_specs, pages_dir, output_dir / "figures", args.dpi)
     log("Segmenting panels and extracting WB/gel strips...")
     panels, strips = segment_and_save_panels(
         figures,
@@ -2789,6 +3163,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 multimodal_review_results or [],
                 source=multimodal_review_source,
             )
+
+    panel_matches: list[PanelMatchCandidate] = []
+    if args.compare_other_panels:
+        log("Comparing non-WB/gel whole panels...")
+        panel_matches = compare_other_panels(
+            panels,
+            output_dir / "matches",
+            args.min_panel_score,
+            args.top_panel_n,
+            args.min_panel_area_ratio,
+            args.panel_scope,
+            comparison_stats,
+        )
     log("Writing report...")
     write_report(
         output_dir,
@@ -2797,6 +3184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strips,
         matches,
         aggregates,
+        panel_matches,
         comparison_stats,
         {
             "dpi": args.dpi,
@@ -2815,7 +3203,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "multimodal_package": args.multimodal_package,
             "multimodal_review_json": multimodal_review_source,
             "multimodal_max_aggregates": args.multimodal_max_aggregates,
+            "compare_other_panels": args.compare_other_panels,
+            "min_panel_score": args.min_panel_score,
+            "min_panel_area_ratio": args.min_panel_area_ratio,
+            "panel_scope": args.panel_scope,
             "pdf_backend": args.pdf_backend,
+            "input_type": input_kind,
+            "input_count": len(input_paths),
         },
     )
 
